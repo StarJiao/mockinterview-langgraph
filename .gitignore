@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+data/
+outputs/*
+!outputs/.gitkeep
+inputs/*
+!inputs/README.md
+!inputs/demo-answers.txt
+.DS_Store

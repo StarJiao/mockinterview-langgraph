@@ -1,0 +1,369 @@
+"""The CLI owns editing. LangGraph receives only explicitly submitted answers."""
+
+import argparse
+import asyncio
+from datetime import datetime
+import os
+from pathlib import Path
+import re
+import shlex
+import sys
+from uuid import uuid4
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.output import ColorDepth
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style
+
+from .config import Config
+from .report import render_report
+from .state import MAX_PROBES, round_label
+
+
+class PauseInterview(Exception):
+    """An unsubmitted answer must never be confused with a submitted empty answer."""
+
+
+def colors_enabled(stream=None, environ=None) -> bool:
+    stream = sys.stdout if stream is None else stream
+    environ = os.environ if environ is None else environ
+    return bool(stream.isatty() and "NO_COLOR" not in environ and environ.get("TERM") != "dumb")
+
+
+class Console:
+    def __init__(self, color: bool | None = None):
+        self.color = colors_enabled() if color is None else color
+
+    def say(self, role: str, text: str) -> None:
+        # Model text is data, not terminal escape commands.
+        text = str(text).replace("\x1b", "")
+        codes = {"面试官": "36", "系统": "33", "你": "32"}
+        line = f"[{role}] {text}"
+        if self.color and role in codes:
+            line = f"\x1b[{codes[role]}m{line}\x1b[0m"
+        print(line, flush=True)
+
+    def system(self, text: str) -> None:
+        self.say("系统", text)
+
+    def separator(self, label: str = "") -> None:
+        print(f"\n{'=' * 18} {label} {'=' * 18}", flush=True)
+
+
+def editor_bindings() -> KeyBindings:
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    def newline(event):
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("escape", "enter")
+    def submit(event):
+        event.app.exit(result=event.current_buffer.text)
+
+    @bindings.add("c-c")
+    @bindings.add("c-d")
+    def pause(event):
+        event.app.exit(exception=PauseInterview())
+
+    return bindings
+
+
+def make_editor(*, input=None, output=None, color: bool = False) -> PromptSession:
+    """Separate input/output injection makes real Chinese editing key paths testable."""
+    return PromptSession(
+        message=[("class:user", "[你] ")],
+        multiline=True,
+        key_bindings=editor_bindings(),
+        prompt_continuation="     ",
+        bottom_toolbar="Enter 换行 · Esc 后 Enter 提交 · Ctrl-C / Ctrl-D 暂停（草稿不保存）",
+        style=Style.from_dict({"user": "ansigreen" if color else ""}),
+        color_depth=ColorDepth.DEPTH_8_BIT if color else ColorDepth.DEPTH_1_BIT,
+        input=input,
+        output=output,
+        enable_history_search=False,
+        enable_open_in_editor=False,
+    )
+
+
+async def read_answer(editor: PromptSession, confirm: PromptSession | None = None) -> str:
+    draft = ""
+    try:
+        while True:
+            answer = await editor.prompt_async(default=draft)
+            if answer.strip():
+                return answer
+            if confirm is None:
+                confirm = PromptSession()
+            choice = await confirm.prompt_async(
+                "[系统] 确认提交空回答？输入 y 确认，其余返回编辑："
+            )
+            if choice.strip().lower() == "y":
+                return ""
+            draft = answer
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise PauseInterview() from exc
+
+
+class ScriptAnswers:
+    """A deliberate test/replay mode; exhausted input pauses instead of submitting blanks."""
+
+    def __init__(self, path: str | Path):
+        content = Path(path).read_text(encoding="utf-8")
+        self.answers = (
+            iter(re.split(r"(?m)^===ANSWER===[ \t]*\r?$", content)) if content else iter(())
+        )
+
+    async def read(self) -> str:
+        try:
+            # Separator-adjacent newlines are formatting, not answer content.
+            return next(self.answers).strip("\r\n")
+        except StopIteration as exc:
+            raise PauseInterview() from exc
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="本地模拟面试 · LangGraph + SQLite")
+
+    def common(target, suppress=False):
+        def default(value):
+            return argparse.SUPPRESS if suppress else value
+
+        target.add_argument(
+            "--env", default=default(".env"), help="dotenv 路径；shell 环境变量优先"
+        )
+        target.add_argument("--data-dir", default=default("data"), help="本地 SQLite 数据目录")
+        target.add_argument("--output-dir", default=default("outputs"), help="Markdown 报告目录")
+        target.add_argument(
+            "--demo", action="store_true", default=default(False), help="离线演示，不调用模型"
+        )
+
+    common(parser)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    new = subparsers.add_parser("new", help="开始新面试")
+    common(new, True)
+    new.add_argument("--jd", help="岗位描述文件")
+    new.add_argument("--resume-file", help="简历文件")
+    new.add_argument("--state", help="薄弱点/学习状态文件")
+    new.add_argument("--focus", action="append", default=[], help="考查方向；可重复或逗号分隔")
+    new.add_argument("--questions", type=int, default=3)
+    new.add_argument("--budget", type=int, help="软 token 预算；允许必要收尾和评分")
+    new.add_argument("--answers", help="脚本模式：以独立行 ===ANSWER=== 分隔答案，耗尽即暂停")
+    resume = subparsers.add_parser("resume", help="继续已有面试")
+    common(resume, True)
+    resume.add_argument("session_id")
+    resume.add_argument("--answers", help="脚本答案文件，耗尽即暂停")
+    sessions = subparsers.add_parser("sessions", help="列出本地会话")
+    common(sessions, True)
+    report = subparsers.add_parser("report", help="从已保存的事实导出报告（不调用模型）")
+    common(report, True)
+    report.add_argument("session_id")
+    return parser
+
+
+def show_plan(console: Console, state: dict) -> None:
+    plan = state.get("plan", [])
+    if plan:
+        console.system(
+            "本场考查方向："
+            + " → ".join(f"{index}. {item.get('topic', '')}" for index, item in enumerate(plan, 1))
+        )
+
+
+def show_history(console: Console, state: dict) -> set[str]:
+    shown_closings = set()
+    for index, question in enumerate(state.get("questions", []), 1):
+        answered = [
+            (i, rd)
+            for i, rd in enumerate(question.get("rounds", []))
+            if rd.get("answer") is not None
+        ]
+        if answered:
+            console.separator(f"历史 · 第 {index} 题 · {question.get('topic', '')}")
+            for round_index, round_ in answered:
+                label = round_label(question, round_index, with_limit=True)
+                console.say("面试官", f"{label}：{round_['ask']}")
+                console.say("你", round_["answer"] or "（已提交空回答）")
+        if question.get("closing"):
+            console.say("面试官", question["closing"])
+            shown_closings.add(question["id"])
+    return shown_closings
+
+
+def save_report(state: dict, session_id: str, directory: str | Path) -> Path:
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    # IDs are validated by the runtime, and still never become path components unchecked.
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
+    path = directory / f"report-{safe_id}.md"
+    path.write_text(render_report({**state, "session_id": session_id}), encoding="utf-8")
+    return path.resolve()
+
+
+def resume_command(args, session_id: str) -> str:
+    pieces = [
+        "uv",
+        "run",
+        "mockinterview",
+        "resume",
+        session_id,
+        "--data-dir",
+        str(args.data_dir),
+        "--output-dir",
+        str(args.output_dir),
+    ]
+    if args.demo:
+        pieces.append("--demo")
+    elif args.env != ".env":
+        pieces.extend(["--env", args.env])
+    return shlex.join(pieces)
+
+
+async def run(args) -> int:
+    # Deferred imports allow --help and editor tests without provider/runtime initialization.
+    from .models import DemoBackend, ModelBackend
+    from .runtime import InterviewApp
+
+    console = Console()
+    session_id = getattr(args, "session_id", None)
+    config = Config.load(args.env)
+    read_only = args.command in {"sessions", "report"}
+    if args.command == "resume":
+        # Read first without constructing a provider client. A saved demo must
+        # remain offline even when the user omits --demo on the resume command.
+        async with InterviewApp(Path(args.data_dir), DemoBackend()) as probe:
+            saved = await probe.inspect(session_id)
+        is_demo = bool(saved.state.get("options", {}).get("demo", False))
+        if args.demo and not is_demo:
+            raise ValueError("真实面试不能用 --demo 恢复，避免混入演示评分")
+        args.demo = is_demo
+        read_only = saved.done
+    if not args.demo and not read_only:
+        missing = []
+        if not config.questioner_api_key:
+            missing.append("DEEPSEEK_API_KEY / QUESTIONER_API_KEY")
+        if not config.evaluator_api_key:
+            missing.append("DASHSCOPE_API_KEY / EVALUATOR_API_KEY")
+        if missing:
+            raise ValueError("缺少模型密钥：" + "、".join(missing) + "；可指定 --env 或使用 --demo")
+    backend = DemoBackend() if args.demo or read_only else ModelBackend(config, console.system)
+    answers = ScriptAnswers(args.answers) if getattr(args, "answers", None) else None
+    editor = None
+    if not read_only and answers is None and not sys.stdin.isatty():
+        raise ValueError("交互编辑需要终端；自动测试请使用 --answers 文件（EOF 不会当作空回答）")
+
+    try:
+        with patch_stdout(raw=True):
+            async with InterviewApp(Path(args.data_dir), backend, notify=console.system) as app:
+                if args.command == "sessions":
+                    for session in await app.sessions():
+                        print(
+                            f"{session['id']}\t{session['status']}\t{session.get('updated_at', '')}"
+                        )
+                    return 0
+                if args.command == "report":
+                    turn = await app.inspect(session_id)
+                    path = save_report(turn.state, session_id, args.output_dir)
+                    console.system(f"报告已写入：{path}")
+                    return 0
+                if args.command == "new":
+                    if args.questions <= 0 or (args.budget is not None and args.budget <= 0):
+                        raise ValueError("题目数和 token 预算必须大于 0")
+
+                    def read(path):
+                        return Path(path).read_text(encoding="utf-8") if path else ""
+
+                    options = {
+                        "jd": read(args.jd),
+                        "resume": read(args.resume_file),
+                        "state_snapshot": read(args.state),
+                        "focus": [
+                            item.strip()
+                            for value in args.focus
+                            for item in value.split(",")
+                            if item.strip()
+                        ]
+                        or ["Go 后端", "Agent 开发"],
+                        "num_questions": args.questions,
+                        "token_budget": args.budget or config.token_budget,
+                        "demo": args.demo,
+                        "questioner_model": "demo" if args.demo else config.questioner_model,
+                        "evaluator_model": "demo" if args.demo else config.evaluator_model,
+                    }
+                    session_id = f"mock-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:6]}"
+                    console.system(f"会话：{session_id}")
+                    turn = await app.start(options, session_id=session_id)
+                    shown_closings = set()
+                else:
+                    turn = await app.resume(session_id)
+                    console.system(f"恢复会话：{session_id}；以下仅重放问答，不重放旧系统消息。")
+                    shown_closings = show_history(console, turn.state)
+                show_plan(console, turn.state)
+                last_question = None
+                while not turn.done:
+                    for question in turn.state.get("questions", []):
+                        if question.get("closing") and question["id"] not in shown_closings:
+                            console.say("面试官", question["closing"])
+                            shown_closings.add(question["id"])
+                    pending = turn.pending
+                    if not pending:
+                        raise RuntimeError("流程未完成且没有等待回答的中断；请恢复会话重试")
+                    if pending["question_id"] != last_question:
+                        console.separator(
+                            f"第 {pending['index'] + 1}/{pending['total']} 题 · {pending['topic']}"
+                        )
+                        last_question = pending["question_id"]
+                    label = (
+                        "题意澄清"
+                        if pending.get("kind") == "clarification"
+                        else "主问"
+                        if pending["hop"] == 0
+                        else f"追问 {pending['hop']}/{MAX_PROBES}"
+                    )
+                    console.say("面试官", f"{label}：{pending['ask']}")
+                    if answers:
+                        answer = await answers.read()
+                        console.say("你", answer or "（脚本已明确提交空回答）")
+                    else:
+                        if editor is None:
+                            editor = make_editor(color=console.color)
+                        answer = await read_answer(editor)
+                    turn = await app.resume(session_id, answer=answer)
+                for question in turn.state.get("questions", []):
+                    if question.get("closing") and question["id"] not in shown_closings:
+                        console.say("面试官", question["closing"])
+                path = save_report(turn.state, session_id, args.output_dir)
+                tokens = sum(turn.state.get("usage", {}).values())
+                console.system(
+                    f"面试完成；{len(turn.state.get('questions', []))} 题，token {tokens}。"
+                )
+                console.system(f"报告：{path}")
+                return 0
+    except (PauseInterview, KeyboardInterrupt, EOFError):
+        console.system("已暂停。已提交内容可恢复，尚未提交的编辑草稿未保存。")
+        if session_id:
+            console.system(f"继续：{resume_command(args, session_id)}")
+        return 0
+    except Exception:
+        if session_id:
+            console.system(f"本次执行未完成；已落盘进度可重试：{resume_command(args, session_id)}")
+        raise
+
+
+def main(argv=None) -> None:
+    args = build_parser().parse_args(argv)
+    try:
+        code = asyncio.run(run(args))
+    except KeyboardInterrupt:
+        print("\n[系统] 已中断；可用 sessions 查找会话后 resume。", file=sys.stderr)
+        code = 130
+    except Exception as exc:
+        # Provider errors may embed request details. Never echo arbitrary exception bodies/keys.
+        if isinstance(exc, (ValueError, FileNotFoundError, PermissionError)):
+            message = str(exc)
+        else:
+            message = f"{type(exc).__name__}；请检查网络、模型配置或已保存的会话状态"
+        print(f"[系统] 执行失败：{message}", file=sys.stderr)
+        code = 1
+    raise SystemExit(code)

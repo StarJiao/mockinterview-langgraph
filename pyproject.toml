@@ -1,0 +1,38 @@
+[project]
+name = "mockinterview-langgraph"
+version = "0.1.0"
+description = "A local mock interview: LangGraph interrupts, SQLite, and editable Chinese answers"
+requires-python = ">=3.11"
+dependencies = [
+  "langgraph>=1.0,<2",
+  "langgraph-checkpoint-sqlite>=3,<4",
+  "langchain-openai>=1,<2",
+  "aiosqlite>=0.20,<1",
+  "pydantic>=2,<3",
+  "prompt-toolkit>=3.0.50,<4",
+  "python-dotenv>=1,<2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1"]
+
+[project.scripts]
+mockinterview = "mockinterview.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mockinterview"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
