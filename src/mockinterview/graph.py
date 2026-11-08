@@ -5,6 +5,10 @@ from langgraph.graph import END, START, StateGraph
 from .state import InterviewState, route_decision, route_progress
 
 
+def route_question(state: dict) -> str:
+    return "decide" if state["questions"][-1]["rounds"][-1].get("answer") is not None else "answer"
+
+
 def build_graph(nodes, checkpointer):
     graph = StateGraph(InterviewState)
     for name in (
@@ -20,7 +24,7 @@ def build_graph(nodes, checkpointer):
         graph.add_node(name, getattr(nodes, name))
     graph.add_edge(START, "plan")
     graph.add_conditional_edges("plan", route_progress, ["question", "report"])
-    graph.add_edge("question", "answer")
+    graph.add_conditional_edges("question", route_question, ["answer", "decide"])
     graph.add_edge("answer", "decide")
     graph.add_conditional_edges("decide", route_decision, ["probe", "finish_question"])
     graph.add_edge("probe", "answer")

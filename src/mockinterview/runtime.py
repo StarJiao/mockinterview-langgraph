@@ -13,9 +13,11 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from .graph import build_graph
+from .identity import CLI_USER
 from .nodes import Nodes
 from .persistence import OperationStore
 from .scoring import ScoringJobs
+from .telemetry import StageRecorder
 
 
 @dataclass
@@ -27,9 +29,10 @@ class Turn:
 
 
 class InterviewApp:
-    def __init__(self, data_dir, backend, notify=lambda _: None):
+    def __init__(self, data_dir, backend, notify=lambda _: None, stage_tracker=None):
         self.data_dir = Path(data_dir)
         self.backend, self.notify = backend, notify
+        self.stage_tracker = stage_tracker
         self._locks = {}
 
     async def __aenter__(self):
@@ -43,9 +46,15 @@ class InterviewApp:
             self.store = OperationStore(self.data_dir / "operations.sqlite")
             await self.store.open()
             self.stack.push_async_callback(self.store.close)
-            self.jobs = ScoringJobs(self.backend, self.store, self.notify)
+            # Every runtime persists stage metrics; only Web supplies a live tracker.
+            self.recorder = StageRecorder(self.store, self.stage_tracker)
+            self.jobs = ScoringJobs(
+                self.backend, self.store, self.notify, recorder=self.recorder
+            )
             self.stack.push_async_callback(self.jobs.close)
-            self.nodes = Nodes(self.backend, self.store, self.jobs, self.notify)
+            self.nodes = Nodes(
+                self.backend, self.store, self.jobs, self.notify, recorder=self.recorder
+            )
             self.graph = build_graph(self.nodes, self.checkpointer)
             return self
         except BaseException:
@@ -70,7 +79,12 @@ class InterviewApp:
         if session_id in self._locks:
             return
         locks = self.data_dir / "locks"
-        locks.mkdir(exist_ok=True)
+        try:
+            locks.mkdir(exist_ok=True)
+        except FileExistsError:
+            # Some host-mediated filesystems report EEXIST despite exist_ok.
+            if not locks.is_dir():
+                raise
         file = (locks / f"{session_id}.lock").open("a")
         try:
             fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -79,12 +93,19 @@ class InterviewApp:
             raise ValueError("这场面试已被另一进程打开，请先退出那个进程") from None
         self._locks[session_id] = file
 
-    async def start(self, options: dict, session_id: str | None = None) -> Turn:
+    async def start(
+        self,
+        options: dict,
+        session_id: str | None = None,
+        *,
+        username: str = CLI_USER,
+        registered: bool = False,
+    ) -> Turn:
         options = {
             "jd": "",
             "resume": "",
             "state_snapshot": "",
-            "focus": ["Go 后端"],
+            "focus": ["综合"],
             "num_questions": 3,
             "token_budget": 200000,
             **options,
@@ -95,10 +116,15 @@ class InterviewApp:
         self._lock(session_id)
         config = self._config(session_id)
         snapshot = await self.graph.aget_state(config)
-        ids = {row[0] for row in await self.store.list_sessions()}
-        if snapshot.values or session_id in ids:
+        # The Web layer registers ownership synchronously so a poll arriving
+        # before the graph task starts can already resolve the session.
+        if not registered:
+            ids = {row[0] for row in await self.store.list_sessions()}
+            if snapshot.values or session_id in ids:
+                raise ValueError(f"会话 {session_id} 已存在，请使用 resume")
+            await self.store.register(session_id, username)
+        elif snapshot.values:
             raise ValueError(f"会话 {session_id} 已存在，请使用 resume")
-        await self.store.register(session_id)
         self.notify(f"会话 ID：{session_id}；中断后用 resume {session_id} 继续")
         await self.graph.ainvoke(
             {
@@ -125,6 +151,7 @@ class InterviewApp:
         collected = await self.nodes.collected(state)
         for key in ("evaluations", "usage"):
             state[key] = {**state.get(key, {}), **collected[key]}
+        state["score_failures"] = await self.store.score_failures(session_id)
         interrupts = [item for task in snapshot.tasks for item in task.interrupts]
         pending = interrupts[0].value if interrupts else None
         return Turn(session_id, state, pending, state.get("status") == "done")
@@ -150,19 +177,46 @@ class InterviewApp:
         await self.graph.ainvoke(value, self._config(session_id), durability="sync")
         return await self.inspect(session_id)
 
-    async def sessions(self) -> list[dict]:
+    async def rescore(self, session_id: str) -> Turn:
+        """Retry only missing scores for a completed interview."""
+        self._lock(session_id)
+        turn = await self.inspect(session_id)
+        if not turn.done:
+            raise ValueError("面试尚未结束，请先使用 resume 完成答题")
+        missing = [
+            q for q in turn.state["questions"]
+            if q["status"] == "done" and q["id"] not in turn.state["evaluations"]
+        ]
+        self.jobs.retry_failed(session_id)
+        for question in missing:
+            await self.jobs.submit(session_id, question)
+        await self.jobs.wait(session_id)
+        return await self.inspect(session_id)
+
+    async def sessions(self, username: str | None = None) -> list[dict]:
         rows = []
-        for session_id, created in await self.store.list_sessions():
+        for session_id, created in await self.store.list_sessions(username):
             snapshot = await self.graph.aget_state(self._config(session_id))
-            if not snapshot.values:
+            values = snapshot.values or {}
+            if not values:
                 status = "未生成 checkpoint"
-            elif snapshot.values.get("status") == "done":
+            elif values.get("status") == "done":
                 status = "done"
             elif any(task.interrupts for task in snapshot.tasks):
                 status = "等待回答"
             else:
                 status = "可恢复"
+            options = values.get("options", {})
+            questions = values.get("questions", [])
             rows.append(
-                {"id": session_id, "status": status, "updated_at": snapshot.created_at or created}
+                {
+                    "id": session_id,
+                    "status": status,
+                    "updated_at": snapshot.created_at or created,
+                    "topic": " / ".join(options.get("focus", [])) or "综合",
+                    "num_questions": options.get("num_questions", len(values.get("plan", []))),
+                    "completed": sum(q.get("status") == "done" for q in questions),
+                    "demo": bool(options.get("demo", False)),
+                }
             )
         return rows

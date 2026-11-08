@@ -15,6 +15,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, ValidationError
 
 from . import prompts
+from . import prompt_versions
 from .contracts import CallResult
 from .schemas import DIMENSIONS, CoverageOutput, EvaluationOutput, PlanOutput, QuestionOutput
 from .state import round_label
@@ -121,7 +122,11 @@ class ModelBackend:
         *,
         questioner=None,
         evaluator=None,
+        prompt_version: str = "original",
     ):
+        if prompt_version not in prompt_versions.VERSIONS:
+            raise ValueError("未知提示词版本")
+        self.prompt_version = prompt_version
         self.notify = notify
         self.judge_model = config.evaluator_model
         self.questioner = (
@@ -197,10 +202,22 @@ class ModelBackend:
 
     async def plan(self, options: dict) -> CallResult:
         count = options["num_questions"]
-        user = f"目标 JD：\n{options.get('jd', '')}\n\n候选人简历：\n{options.get('resume', '')}\n"
+        # Web sessions may supply several JDs. Legacy options carry one string.
+        jds = options.get("jds") or []
+        jd_text = (
+            "\n\n".join(f"【目标 JD {i}】\n{jd}" for i, jd in enumerate(jds, 1))
+            if jds
+            else options.get("jd", "")
+        )
+        user = f"目标 JD：\n{jd_text}\n\n候选人简历：\n{options.get('resume', '')}\n"
         if options.get("state_snapshot", "").strip():
             user += f"\n候选人掌握状态快照（薄弱点加权依据）：\n{options['state_snapshot']}\n"
         user += f"\n本场 focus 方向：{' / '.join(options.get('focus', []))}；必须输出恰好 {count} 个有序考点。"
+        if not any(
+            text.strip()
+            for text in (jd_text, options.get("resume", ""), options.get("state_snapshot", ""))
+        ):
+            user += "\n未提供 JD、简历或掌握状态。只能按 focus 出通用假设题；不得推测候选人的项目经历、已测能力或薄弱点。"
         messages = [SystemMessage(content=prompts.PLAN), HumanMessage(content=user)]
         result = await self._structured(self.questioner, messages, PlanOutput)
         total = result.tokens
@@ -230,6 +247,21 @@ class ModelBackend:
                 )
         normalized = 0
         for topic in result.data["topics"]:
+            if not options.get("resume", "").strip() and topic["evidence"] == "project":
+                topic["evidence"] = "theoretical"
+            if not options.get("state_snapshot", "").strip() and topic["evidence"] == "tested":
+                topic["evidence"] = "theoretical"
+            has_jd = bool(jd_text.strip())
+            has_resume = bool(options.get("resume", "").strip())
+            has_state = bool(options.get("state_snapshot", "").strip())
+            if not any((has_jd, has_resume, has_state)):
+                topic["source"] = "focus"
+            elif topic["source"] == "resume" and not has_resume:
+                topic["source"] = "jd" if has_jd else "state-snapshot"
+            elif topic["source"] == "state-snapshot" and not has_state:
+                topic["source"] = "resume" if has_resume else "jd"
+            elif topic["source"] == "jd" and not has_jd:
+                topic["source"] = "resume" if has_resume else "state-snapshot"
             if topic["evidence"] not in ("project", "tested"):
                 topic.update(
                     evidence="theoretical", weak=False, difficulty=min(topic["difficulty"], 2)
@@ -302,7 +334,7 @@ class ModelBackend:
         )
         result = await self._structured(
             self.questioner,
-            [SystemMessage(content=prompts.COVERAGE), HumanMessage(content=user)],
+            [SystemMessage(content=prompt_versions.COVERAGE[self.prompt_version]), HumanMessage(content=user)],
             CoverageOutput,
         )
         result.data["score"] = max(0, min(100, result.data["score"]))
@@ -320,7 +352,9 @@ class ModelBackend:
                 f"\n备选考察角度（不得重复已确认的内容）：{'；'.join(question.get('probe_angles', []))}"
                 f"\n请给出第 {hop} 次正式追问；必要时先交代背景，只问一个点。"
             )
-        return await self._text(prompts.CLARIFY if clarifying else prompts.PROBE, user)
+        return await self._text(
+            prompts.CLARIFY if clarifying else prompt_versions.PROBE[self.prompt_version], user
+        )
 
     async def closing(self, question: dict, reason: str, struggle: bool) -> CallResult:
         rule = (

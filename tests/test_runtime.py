@@ -126,6 +126,37 @@ async def wait_for_evaluation(app, session_id, qid):
             await asyncio.sleep(0)
 
 
+async def test_failed_scoring_does_not_block_completion_and_can_be_retried(tmp_path):
+    class FailingBackend(FakeBackend):
+        fail_score = True
+
+        async def evaluate(self, question):
+            if self.fail_score:
+                self.calls["evaluate"] += 1
+                raise TimeoutError("private provider details")
+            return await super().evaluate(question)
+
+    backend = FailingBackend(coverage_score=100)
+    async with app_at(tmp_path, backend) as app:
+        await app.start(options(), session_id="score-failure")
+        finished = await app.resume("score-failure", "完整回答")
+        qid = finished.state["questions"][0]["id"]
+        assert finished.done
+        assert qid not in finished.state["evaluations"]
+        assert finished.state["score_failures"][qid] == "TimeoutError"
+        assert backend.calls["evaluate"] == 2
+
+    async with app_at(tmp_path, backend) as app:
+        saved = await app.inspect("score-failure")
+        assert saved.done and saved.state["score_failures"][qid] == "TimeoutError"
+        backend.fail_score = False
+        repaired = await app.rescore("score-failure")
+        assert repaired.done
+        assert qid in repaired.state["evaluations"]
+        assert repaired.state["score_failures"] == {}
+        assert backend.calls["coverage"] == 1
+
+
 async def test_saved_interrupt_survives_restart_and_followup_limit(tmp_path):
     backend = FakeBackend()
     async with app_at(tmp_path, backend) as app:
@@ -405,3 +436,32 @@ async def test_question_checkpoint_failure_does_not_regenerate_saved_model_resul
         assert recovered.pending
         assert backend.calls["question"] == 1
         assert current_question(recovered)["rounds"][0]["answer"] is None
+
+
+async def test_stage_metrics_are_written_by_cli_runtime_and_record_failures(tmp_path):
+    from mockinterview.models import ModelOutputError
+
+    class FailedPlan(FakeBackend):
+        async def plan(self, config):
+            raise ModelOutputError("规划输出无效", tokens=99)
+
+    # The CLI runtime has no live StageTracker; metrics must still land in SQLite.
+    async with app_at(tmp_path, FailedPlan()) as app:
+        with pytest.raises(ModelOutputError):
+            await app.start(options(), "metric-failure")
+        failed = await app.store.stage_metrics("metric-failure")
+        assert len(failed) == 1
+        assert failed[0]["key"] == "plan"
+        assert failed[0]["label"] == "生成考点计划"
+        assert failed[0]["ok"] is False
+        assert failed[0]["error"] == "ModelOutputError"
+        assert failed[0]["tokens"] == 99
+        assert failed[0]["duration_ms"] >= 0
+        assert "规划输出无效" not in str(failed[0])  # provider text is not stored
+
+    async with app_at(tmp_path, FakeBackend()) as app:
+        assert await app.store.stage_metrics("metric-failure") == failed
+        summary = await app.store.stage_summary("metric-failure")
+        assert summary["calls"] == 1
+        assert summary["total_tokens"] == 99
+        assert summary["failures"] == 1

@@ -11,6 +11,8 @@ dependencies = [
   "pydantic>=2,<3",
   "prompt-toolkit>=3.0.50,<4",
   "python-dotenv>=1,<2",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
 ]
 
 [dependency-groups]

@@ -10,4 +10,6 @@ outputs/*
 inputs/*
 !inputs/README.md
 !inputs/demo-answers.txt
+!inputs/preset-example.json
+!inputs/preset-followup-example.json
 .DS_Store

@@ -275,6 +275,32 @@ async def test_demo_resume_without_flag_stays_offline(tmp_path, monkeypatch):
     assert args.demo is True
 
 
+async def test_omitted_jd_and_resume_are_empty_in_saved_session(tmp_path):
+    from mockinterview.cli import run
+    from mockinterview.models import DemoBackend
+    from mockinterview.runtime import InterviewApp
+
+    answer_file = tmp_path / "empty.txt"
+    answer_file.write_text("", encoding="utf-8")
+    args = build_parser().parse_args([
+        "new", "--demo", "--questions", "1", "--answers", str(answer_file),
+        "--data-dir", str(tmp_path / "data"),
+    ])
+    assert args.jd is None and args.resume_file is None
+    assert await run(args) == 0
+    async with InterviewApp(tmp_path / "data", DemoBackend()) as app:
+        sessions = await app.sessions()
+        turn = await app.inspect(sessions[0]["id"])
+        assert turn.state["options"]["jd"] == ""
+        assert turn.state["options"]["resume"] == ""
+        assert turn.state["options"]["focus"] == ["综合"]
+
+
+def test_new_without_focus_has_no_personal_default():
+    args = build_parser().parse_args(["new", "--jd", "job.txt", "--resume-file", "resume.md"])
+    assert args.focus == []
+
+
 async def test_demo_cannot_mix_into_real_session(tmp_path):
     from mockinterview.cli import run
     from mockinterview.models import DemoBackend

@@ -35,6 +35,37 @@ class FakeModel:
         )
 
 
+async def test_prompt_versions_keep_original_and_change_only_selected_instructions():
+    from mockinterview import prompts, prompt_versions
+
+    assert prompt_versions.COVERAGE["original"] == prompts.COVERAGE
+    assert prompt_versions.PROBE["original"] == prompts.PROBE
+    assert prompt_versions.COVERAGE["improved_v2"].startswith(prompt_versions.COVERAGE["improved"])
+    assert "准确回查这次调用" in prompt_versions.COVERAGE["improved_v2"]
+    question = {
+        "text": "历史太长怎么办？", "reference_points": ["根据任务选择上下文"],
+        "rounds": [{"kind": "main", "ask": "历史太长怎么办？", "answer": "摘要并外置原文"}],
+    }
+    reply = {
+        "answer_kind": "answer", "reason": "已有方案", "score": 80,
+        "covered": ["摘要与外置"], "missed": [], "sufficient": True,
+        "has_new_evidence": True, "next_target": "无需追问",
+    }
+    systems = []
+    for version in ("original", "improved"):
+        model = FakeModel([reply, "具体说明回查方式？"])
+        adapter = ModelBackend(
+            SimpleNamespace(evaluator_model="fake-judge"),
+            questioner=model, evaluator=FakeModel([]), prompt_version=version,
+        )
+        await adapter.coverage(question)
+        await adapter.probe(question, "回查方式", 1)
+        systems.append([call[0].content for call in model.calls])
+    assert systems[0] == [prompts.COVERAGE, prompts.PROBE]
+    assert systems[1][0] != systems[0][0]
+    assert systems[1][1] != systems[0][1]
+
+
 def backend(questioner=(), evaluator=(), notify=lambda msg: None):
     return ModelBackend(
         SimpleNamespace(evaluator_model="fake-judge"),
@@ -138,6 +169,19 @@ async def test_plan_exact_count_one_retry_and_evidence_clamp():
     assert result.data[0]["weak"] is False
     assert "状态" in model.questioner.calls[0][1].content
     assert any("纠错" in notice for notice in notices)
+
+
+async def test_plan_without_personal_inputs_cannot_invent_project_evidence():
+    model = backend(questioner=[{"topics": [topic()]}])
+    result = await model.plan({
+        "num_questions": 1, "focus": ["通用后端"], "jd": "", "resume": "",
+        "state_snapshot": "",
+    })
+    assert result.data[0]["source"] == "focus"
+    assert result.data[0]["evidence"] == "theoretical"
+    assert result.data[0]["weak"] is False
+    assert result.data[0]["difficulty"] <= 2
+    assert "不得推测候选人的项目经历" in model.questioner.calls[0][1].content
 
 
 async def test_plan_bad_count_after_retry_is_error():

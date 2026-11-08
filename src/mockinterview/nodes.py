@@ -5,21 +5,31 @@ from copy import deepcopy
 from langgraph.types import interrupt
 
 from .state import MAX_PROBES, budget_exceeded, conclude, count_rounds, decide_probe, round_kind
+from .telemetry import null_stage
 
 
 class Nodes:
-    def __init__(self, backend, store, jobs, notify):
+    def __init__(self, backend, store, jobs, notify, recorder=None):
         self.backend, self.store, self.jobs, self.notify = backend, store, jobs, notify
+        self.recorder = recorder
 
     async def call(self, state: dict, key: str, invoke):
-        result = await self.store.get(state["session_id"], key)
-        if result is None:
+        session_id = state["session_id"]
+        result = await self.store.get(session_id, key)
+        if result is not None:
+            # A replay reuses the durable receipt: no model call, no new metric.
+            return deepcopy(result.data), {key: result.tokens}
+        stage = self.recorder.stage(session_id, key) if self.recorder else null_stage()
+        async with stage as metric:
             try:
                 result = await invoke()
             except Exception as exc:
-                await self.store.record_failed_usage(state["session_id"], getattr(exc, "tokens", 0))
+                await self.store.record_failed_usage(
+                    session_id, getattr(exc, "tokens", 0)
+                )
                 raise
-            await self.store.put(state["session_id"], key, result)
+            metric["tokens"] = int(result.tokens or 0)
+            await self.store.put(session_id, key, result)
         return deepcopy(result.data), {key: result.tokens}
 
     async def collected(self, state: dict) -> dict:
@@ -36,6 +46,14 @@ class Nodes:
         return {"evaluations": evaluations, "usage": usage}
 
     async def plan(self, state: dict) -> dict:
+        preset = state["options"].get("preset_questions")
+        if preset:
+            return {"plan": [
+                {"topic": q["topic"], "direction": "预定题目", "points": q["reference_points"],
+                 "difficulty": q["difficulty"], "source": "preset", "weak": False,
+                 "evidence": "theoretical"}
+                for q in preset
+            ]}
         self.notify("生成本场有序考点…")
         plan, usage = await self.call(state, "plan", lambda: self.backend.plan(state["options"]))
         if len(plan) != state["options"]["num_questions"]:
@@ -48,19 +66,28 @@ class Nodes:
     async def question(self, state: dict) -> dict:
         index = len(state["questions"])
         topic = state["plan"][index]
-        self.notify(f"正在生成第 {index + 1} 题：{topic['topic']}")
-        draft, usage = await self.call(
-            state,
-            f"question:{index}",
-            lambda: self.backend.question(topic, index + 1, len(state["plan"])),
-        )
+        preset = state["options"].get("preset_questions")
+        if preset:
+            fixed = preset[index]
+            draft = {"topic": fixed["topic"], "difficulty": fixed["difficulty"],
+                     "text": fixed["rounds"][0]["ask"],
+                     "reference_points": fixed["reference_points"], "probe_angles": []}
+            usage = {}
+        else:
+            self.notify(f"正在生成第 {index + 1} 题：{topic['topic']}")
+            draft, usage = await self.call(
+                state,
+                f"question:{index}",
+                lambda: self.backend.question(topic, index + 1, len(state["plan"])),
+            )
         questions = deepcopy(state["questions"])
         questions.append(
             {
                 **draft,
                 "id": f"{state['session_id']}-q{index + 1}",
                 "status": "running",
-                "rounds": [{"kind": "main", "ask": draft["text"], "answer": None}],
+                "rounds": deepcopy(fixed["rounds"]) if preset else
+                [{"kind": "main", "ask": draft["text"], "answer": None}],
                 "closing": "",
                 "closing_reason": "",
             }
@@ -170,8 +197,4 @@ class Nodes:
         self.notify("等待所有单题评分完成…")
         await self.jobs.wait(state["session_id"])
         collected = await self.collected(state)
-        scores = {**state["evaluations"], **collected["evaluations"]}
-        missing = [q["id"] for q in state["questions"] if q["id"] not in scores]
-        if missing:
-            raise RuntimeError(f"单题评分尚未完成，可恢复补评：{', '.join(missing)}")
         return {**collected, "status": "done"}

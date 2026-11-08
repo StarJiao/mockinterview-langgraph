@@ -147,18 +147,30 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--resume-file", help="简历文件")
     new.add_argument("--state", help="薄弱点/学习状态文件")
     new.add_argument("--focus", action="append", default=[], help="考查方向；可重复或逗号分隔")
-    new.add_argument("--questions", type=int, default=3)
+    new.add_argument("--questions", type=int)
+    new.add_argument("--preset", help="预定题目 JSON 文件；题数由文件决定")
+    new.add_argument("--prompt-version", choices=("original", "improved", "improved_v2"), default=None)
     new.add_argument("--budget", type=int, help="软 token 预算；允许必要收尾和评分")
     new.add_argument("--answers", help="脚本模式：以独立行 ===ANSWER=== 分隔答案，耗尽即暂停")
     resume = subparsers.add_parser("resume", help="继续已有面试")
     common(resume, True)
     resume.add_argument("session_id")
     resume.add_argument("--answers", help="脚本答案文件，耗尽即暂停")
+    resume.add_argument("--prompt-version", choices=("original", "improved", "improved_v2"), default=None)
     sessions = subparsers.add_parser("sessions", help="列出本地会话")
     common(sessions, True)
     report = subparsers.add_parser("report", help="从已保存的事实导出报告（不调用模型）")
     common(report, True)
     report.add_argument("session_id")
+    score = subparsers.add_parser("score", help="对已结束面试的缺分题目单独补评")
+    common(score, True)
+    score.add_argument("session_id")
+    web = subparsers.add_parser("web", help="启动本机 Web 界面（无密码，按用户名分组）")
+    common(web, True)
+    web.add_argument(
+        "--host", default="0.0.0.0", help="监听地址；默认所有网卡，可用 127.0.0.1 收回"
+    )
+    web.add_argument("--port", type=int, default=8000, help="监听端口")
     return parser
 
 
@@ -228,17 +240,58 @@ async def run(args) -> int:
     console = Console()
     session_id = getattr(args, "session_id", None)
     config = Config.load(args.env)
+    if args.command == "web":
+        from .web import serve
+
+        if not args.demo:
+            missing = []
+            if not config.questioner_api_key:
+                missing.append("DEEPSEEK_API_KEY / QUESTIONER_API_KEY")
+            if not config.evaluator_api_key:
+                missing.append("DASHSCOPE_API_KEY / EVALUATOR_API_KEY")
+            if missing:
+                raise ValueError("缺少模型密钥：" + "、".join(missing) + "；可指定 --env 或使用 --demo")
+        backend = DemoBackend() if args.demo else ModelBackend(
+            config, console.system, prompt_version="original"
+        )
+        options_base = {
+            "token_budget": config.token_budget,
+            "demo": args.demo,
+            "prompt_version": "original",
+            "questioner_model": "demo" if args.demo else config.questioner_model,
+            "evaluator_model": "demo" if args.demo else config.evaluator_model,
+        }
+        shown_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
+        console.system(
+            f"Web 界面：http://{shown_host}:{args.port}（监听 {args.host}:{args.port}）；"
+            "用户名只用于区分数据，不是安全登录，请勿在不可信网络开放。"
+        )
+        await serve(
+            backend, Path(args.data_dir), options_base, args.host, args.port, notify=console.system
+        )
+        return 0
     read_only = args.command in {"sessions", "report"}
-    if args.command == "resume":
+    if args.command in {"resume", "score"}:
         # Read first without constructing a provider client. A saved demo must
         # remain offline even when the user omits --demo on the resume command.
         async with InterviewApp(Path(args.data_dir), DemoBackend()) as probe:
             saved = await probe.inspect(session_id)
+        if args.command == "score" and not saved.done:
+            raise ValueError("面试尚未结束，请先使用 resume 完成答题")
         is_demo = bool(saved.state.get("options", {}).get("demo", False))
         if args.demo and not is_demo:
             raise ValueError("真实面试不能用 --demo 恢复，避免混入演示评分")
         args.demo = is_demo
-        read_only = saved.done
+        saved_version = saved.state.get("options", {}).get("prompt_version", "original")
+        if getattr(args, "prompt_version", None) is not None and args.prompt_version != saved_version:
+            raise ValueError("恢复时提示词版本必须与会话创建时一致；请新建会话做版本对比")
+        args.prompt_version = saved_version
+        read_only = saved.done if args.command == "resume" else not any(
+            q["status"] == "done" and q["id"] not in saved.state["evaluations"]
+            for q in saved.state["questions"]
+        )
+    if args.command == "new":
+        args.prompt_version = args.prompt_version or "original"
     if not args.demo and not read_only:
         missing = []
         if not config.questioner_api_key:
@@ -247,10 +300,12 @@ async def run(args) -> int:
             missing.append("DASHSCOPE_API_KEY / EVALUATOR_API_KEY")
         if missing:
             raise ValueError("缺少模型密钥：" + "、".join(missing) + "；可指定 --env 或使用 --demo")
-    backend = DemoBackend() if args.demo or read_only else ModelBackend(config, console.system)
+    backend = DemoBackend() if args.demo or read_only else ModelBackend(
+        config, console.system, prompt_version=args.prompt_version or "original"
+    )
     answers = ScriptAnswers(args.answers) if getattr(args, "answers", None) else None
     editor = None
-    if not read_only and answers is None and not sys.stdin.isatty():
+    if args.command in {"new", "resume"} and not read_only and answers is None and not sys.stdin.isatty():
         raise ValueError("交互编辑需要终端；自动测试请使用 --answers 文件（EOF 不会当作空回答）")
 
     try:
@@ -267,13 +322,27 @@ async def run(args) -> int:
                     path = save_report(turn.state, session_id, args.output_dir)
                     console.system(f"报告已写入：{path}")
                     return 0
+                if args.command == "score":
+                    turn = await app.rescore(session_id) if not read_only else await app.inspect(session_id)
+                    path = save_report(turn.state, session_id, args.output_dir)
+                    missing = sum(
+                        q["status"] == "done" and q["id"] not in turn.state["evaluations"]
+                        for q in turn.state["questions"]
+                    )
+                    console.system(f"补评完成；仍有 {missing} 题未评分。报告：{path}")
+                    return 0 if missing == 0 else 1
                 if args.command == "new":
-                    if args.questions <= 0 or (args.budget is not None and args.budget <= 0):
+                    if (args.questions is not None and args.questions <= 0) or (args.budget is not None and args.budget <= 0):
                         raise ValueError("题目数和 token 预算必须大于 0")
 
                     def read(path):
                         return Path(path).read_text(encoding="utf-8") if path else ""
 
+                    from .preset import load_preset
+
+                    preset = load_preset(args.preset) if args.preset else None
+                    if preset and args.questions is not None:
+                        raise ValueError("使用 --preset 时不要同时指定 --questions；题数由文件决定")
                     options = {
                         "jd": read(args.jd),
                         "resume": read(args.resume_file),
@@ -284,10 +353,12 @@ async def run(args) -> int:
                             for item in value.split(",")
                             if item.strip()
                         ]
-                        or ["Go 后端", "Agent 开发"],
-                        "num_questions": args.questions,
+                        or ["综合"],
+                        "num_questions": len(preset) if preset else (args.questions or 3),
                         "token_budget": args.budget or config.token_budget,
                         "demo": args.demo,
+                        "prompt_version": args.prompt_version,
+                        "preset_questions": preset,
                         "questioner_model": "demo" if args.demo else config.questioner_model,
                         "evaluator_model": "demo" if args.demo else config.evaluator_model,
                     }
@@ -339,6 +410,12 @@ async def run(args) -> int:
                     f"面试完成；{len(turn.state.get('questions', []))} 题，token {tokens}。"
                 )
                 console.system(f"报告：{path}")
+                missing = sum(
+                    q["status"] == "done" and q["id"] not in turn.state["evaluations"]
+                    for q in turn.state["questions"]
+                )
+                if missing:
+                    console.system(f"有 {missing} 题评分失败；可运行 uv run mockinterview score {session_id} 补评。")
                 return 0
     except (PauseInterview, KeyboardInterrupt, EOFError):
         console.system("已暂停。已提交内容可恢复，尚未提交的编辑草稿未保存。")
