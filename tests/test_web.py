@@ -1,7 +1,9 @@
 """Web UI contract tests use the offline backend and a real SQLite data dir."""
 
 import json
+import secrets
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -33,8 +35,25 @@ async def web(tmp_path):
             yield client, service, application
 
 
-async def login(client, username="alice"):
-    response = await client.post("/api/login", json={"username": username})
+async def make_pass(service, kind="long", hours=1, quota=None):
+    """Issue a real pass row; returns (raw_token, pass_id)."""
+    token = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(hours=hours)).isoformat()
+    ttl_seconds = hours * 3600 if kind == "temp" else None
+    pass_id = await service.store.create_pass(
+        token, kind, expires, quota_tokens=quota, ttl_seconds=ttl_seconds
+    )
+    return token, pass_id
+
+
+async def login(client, username="alice", service=None, token=None):
+    if token is None:
+        assert service is not None, "login needs either a token or the service"
+        token, _ = await make_pass(service)
+    response = await client.post(
+        "/api/login", json={"username": username, "pass_token": token}
+    )
     assert response.status_code == 200
     return response.json()
 
@@ -54,13 +73,15 @@ async def settle(client, service, session_id):
 
 
 async def test_login_requires_username_and_static_pages_are_public(web):
-    client, _, _ = web
+    client, service, _ = web
     assert (await client.get("/api/me")).status_code == 401
     assert (await client.get("/")).status_code == 200
     assert (await client.get("/app.js")).status_code == 200
     assert (await client.post("/api/login", json={"username": "bad/name"})).status_code == 400
-    assert (await login(client))["username"] == "alice"
-    assert (await client.get("/api/me")).json() == {"username": "alice"}
+    assert (await login(client, service=service))["username"] == "alice"
+    me = (await client.get("/api/me")).json()
+    assert me["username"] == "alice"
+    assert me["pass"]["kind"] == "long"
 
 
 async def test_legacy_database_sessions_are_backfilled_to_cli_user(tmp_path):
@@ -97,7 +118,7 @@ async def test_cli_sessions_belong_to_cli_and_web_users_stay_separate(web):
     await service.app.start(options, session_id="cli-session")
     assert await service.store.owner("cli-session") == CLI_USER
 
-    await login(client, "alice")
+    await login(client, "alice", service=service)
     assert (await client.get("/api/interviews")).json()["sessions"] == []
     assert (await client.get("/api/interviews/cli-session")).status_code == 404
 
@@ -105,7 +126,7 @@ async def test_cli_sessions_belong_to_cli_and_web_users_stay_separate(web):
         transport=httpx.ASGITransport(app=application), base_url="http://test"
     )
     async with cli_view:
-        await login(cli_view, CLI_USER)
+        await login(cli_view, CLI_USER, service=service)
         listed = (await cli_view.get("/api/interviews")).json()["sessions"]
         assert [item["id"] for item in listed] == ["cli-session"]
         assert (await cli_view.get("/api/interviews/cli-session")).status_code == 200
@@ -114,13 +135,13 @@ async def test_cli_sessions_belong_to_cli_and_web_users_stay_separate(web):
         transport=httpx.ASGITransport(app=application), base_url="http://test"
     )
     async with bob:
-        await login(bob, "bob")
+        await login(bob, "bob", service=service)
         assert (await bob.get("/api/interviews")).json()["sessions"] == []
 
 
 async def test_topic_and_question_count_are_required_and_jds_are_optional(web):
     client, service, application = web
-    await login(client)
+    await login(client, service=service)
     assert (await new_interview(client, topic="")).status_code == 400
     assert (await new_interview(client, num_questions=0)).status_code == 400
     assert (await new_interview(client, num_questions=11)).status_code == 400
@@ -151,7 +172,7 @@ async def test_topic_and_question_count_are_required_and_jds_are_optional(web):
 
 async def test_detail_is_available_immediately_after_creation(web):
     client, service, _ = web
-    await login(client)
+    await login(client, service=service)
     created = await new_interview(client)
     assert created.status_code == 202
     session_id = created.json()["id"]
@@ -165,7 +186,7 @@ async def test_detail_is_available_immediately_after_creation(web):
 
 async def test_stream_shows_three_roles_and_resume_until_done(web):
     client, service, application = web
-    await login(client)
+    await login(client, service=service)
     created = await new_interview(client, topic="Go 并发", num_questions=1)
     session_id = created.json()["id"]
     detail = await settle(client, service, session_id)
@@ -199,7 +220,7 @@ async def test_stream_shows_three_roles_and_resume_until_done(web):
 
 async def test_web_refuses_continuing_a_session_with_a_mismatched_backend(web):
     client, service, _ = web
-    await login(client)
+    await login(client, service=service)
     session_id = (await new_interview(client)).json()["id"]
     await settle(client, service, session_id)
 
@@ -222,7 +243,7 @@ async def test_web_refuses_continuing_a_session_with_a_mismatched_backend(web):
 
 async def test_completed_interview_cannot_continue_but_report_is_readable(web):
     client, service, application = web
-    await login(client)
+    await login(client, service=service)
     session_id = (await new_interview(client, topic="系统设计", num_questions=1)).json()["id"]
     for _ in range(8):
         detail = await settle(client, service, session_id)
@@ -246,7 +267,7 @@ async def test_completed_interview_cannot_continue_but_report_is_readable(web):
 
 async def test_sessions_are_isolated_between_usernames(web):
     alice, service, application = web
-    await login(alice, "alice")
+    await login(alice, "alice", service=service)
     session_id = (await new_interview(alice, topic="Go 并发", num_questions=1)).json()["id"]
     await settle(alice, service, session_id)
 
@@ -254,7 +275,7 @@ async def test_sessions_are_isolated_between_usernames(web):
         transport=httpx.ASGITransport(app=application), base_url="http://test"
     )
     async with bob:
-        await login(bob, "bob")
+        await login(bob, "bob", service=service)
         assert (await bob.get("/api/interviews")).json()["sessions"] == []
         for path, method in [
             (f"/api/interviews/{session_id}", "get"),
@@ -270,7 +291,7 @@ async def test_sessions_are_isolated_between_usernames(web):
 
 async def test_status_heartbeat_returns_a_change_marker_without_full_detail(web):
     client, service, _ = web
-    await login(client)
+    await login(client, service=service)
     session_id = (await new_interview(client)).json()["id"]
     await settle(client, service, session_id)
 
@@ -292,7 +313,7 @@ async def test_status_heartbeat_returns_a_change_marker_without_full_detail(web)
 
 async def test_stage_timings_are_recorded_for_planning_and_questions(web):
     client, service, _ = web
-    await login(client)
+    await login(client, service=service)
     session_id = (await new_interview(client)).json()["id"]
     await settle(client, service, session_id)
     timings = (await client.get(f"/api/interviews/{session_id}/timings")).json()
@@ -350,7 +371,7 @@ async def test_multi_jd_reaches_plan_prompt_without_breaking_legacy_options():
 
 async def test_stage_metrics_are_durable_and_survive_a_reopened_store(web):
     client, service, _ = web
-    await login(client)
+    await login(client, service=service)
     session_id = (await new_interview(client)).json()["id"]
     await settle(client, service, session_id)
 
@@ -397,3 +418,146 @@ async def test_stage_metrics_are_durable_and_survive_a_reopened_store(web):
     )
     after = (await client.get(f"/api/interviews/{session_id}/status")).json()["revision"]
     assert after != before
+
+
+async def test_api_requires_a_valid_pass_and_exchange_route_sets_the_cookie(web):
+    client, service, application = web
+    assert (await client.get("/api/interviews")).status_code == 401
+    assert (await client.get("/api/interviews")).json()["detail"] == (
+        "需要访问令牌：请通过带 ?pass= 的链接进入，或在登录框填入令牌"
+    )
+    no_token = await client.post("/api/login", json={"username": "alice"})
+    assert no_token.status_code == 401
+    bad = await client.post("/api/login", json={"username": "alice", "pass_token": "nope"})
+    assert bad.status_code == 401
+    assert "重新获取" in bad.json()["detail"]
+
+    token, _ = await make_pass(service)
+    fresh = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://test"
+    )
+    async with fresh:
+        junk = await fresh.get("/pass/junk-token", follow_redirects=False)
+        assert junk.status_code == 302
+        assert junk.headers["location"] == "/?pass_error=1"
+        exchanged = await fresh.get(f"/pass/{token}", follow_redirects=False)
+        assert exchanged.status_code == 302
+        assert exchanged.headers["location"] == f"/?pass={token}"
+        # The friend lands on the login form with the token prefilled; entering
+        # only a username creates the user on first login.
+        assert (await fresh.post("/api/login", json={"username": "carol", "pass_token": token})).status_code == 200
+        me = (await fresh.get("/api/me")).json()
+        assert me["username"] == "carol"
+        assert me["pass"]["kind"] == "long"
+        assert (await fresh.get("/api/interviews")).status_code == 200
+        assert (await fresh.post("/api/logout", json={})).status_code == 200
+        assert (await fresh.get("/api/interviews")).status_code == 401
+
+
+async def test_expired_and_revoked_passes_are_rejected(web):
+    client, service, _ = web
+    expired, _ = await make_pass(service, hours=-1)
+    response = await client.post(
+        "/api/login", json={"username": "alice", "pass_token": expired}
+    )
+    assert response.status_code == 401
+    assert "无效或已过期" in response.json()["detail"]
+
+    token, pass_id = await make_pass(service)
+    await login(client, "alice", token=token)
+    assert (await client.get("/api/interviews")).status_code == 200
+    assert await service.store.revoke_pass(pass_id) is True
+    assert (await client.get("/api/interviews")).status_code == 401
+    assert "无效或已过期" in (await client.get("/api/interviews")).json()["detail"]
+
+
+async def test_temp_pass_quota_blocks_model_work_but_reads_stay_open(web):
+    client, service, _ = web
+    token, pass_id = await make_pass(service, kind="temp", hours=1, quota=10)
+    await login(client, "guest", token=token)
+    created = await new_interview(client)
+    assert created.status_code == 202
+    session_id = created.json()["id"]
+    await settle(client, service, session_id)
+
+    # Simulate the real model spend this pass caused (started after the link).
+    await service.store.link_pass_session(pass_id, session_id)
+    await service.store.add_stage_metric(
+        session_id,
+        {
+            "stage_key": "manual:quota",
+            "label": "模型调用",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "duration_ms": 500,
+            "tokens": 100,
+            "ok": True,
+            "error": "",
+            "attempts": 1,
+        },
+    )
+    assert await service.store.pass_usage(pass_id) >= 100
+
+    blocked = await new_interview(client)
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"]["quota_exhausted"] is True
+    answer = await client.post(
+        f"/api/interviews/{session_id}/answer", json={"answer": "还想继续作答"}
+    )
+    assert answer.status_code == 403
+    assert answer.json()["detail"]["quota_exhausted"] is True
+    assert (await client.post(f"/api/interviews/{session_id}/resume")).status_code == 403
+
+    # Reads, history and reports stay open after exhaustion.
+    assert (await client.get(f"/api/interviews/{session_id}")).status_code == 200
+    assert (await client.get("/api/interviews")).status_code == 200
+    assert (await client.get(f"/api/interviews/{session_id}/report")).status_code == 200
+
+    # Switching usernames under the same pass still works (grouping label only).
+    assert (await client.post("/api/login", json={"username": "guest2", "pass_token": token})).status_code == 200
+    assert (await client.get("/api/interviews")).json()["sessions"] == []
+
+    # A long pass never hits the quota guard.
+    long_token, _ = await make_pass(service, kind="long")
+    await login(client, "owner", token=long_token)
+    assert (await new_interview(client)).status_code == 202
+
+
+async def test_temp_pass_clock_starts_on_first_use_not_at_issue_time(web):
+    client, service, _ = web
+    token, _ = await make_pass(service, kind="temp", hours=1)
+    # Simulate a pass issued long ago that was never opened: under the old
+    # "expiry fixed at issue" rule this login would be rejected.
+    stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    await service.store.conn.execute(
+        "UPDATE passes SET created_at=?, expires_at=? WHERE token_hash IN "
+        "(SELECT token_hash FROM passes WHERE id = (SELECT MAX(id) FROM passes))",
+        (stale, stale),
+    )
+    await service.store.conn.commit()
+    rows = await service.store.list_passes()
+    issued_id = rows[-1]["id"]
+
+    # First use: the gate activates the pass and grants a full fresh hour.
+    await login(client, "late-guest", token=token)
+    me = (await client.get("/api/me")).json()
+    assert me["pass"]["kind"] == "temp"
+    activated = datetime.fromisoformat(me["pass"]["expires_at"])
+    assert activated > datetime.now(timezone.utc) + timedelta(minutes=55)
+
+    stored = await service.store.get_pass(issued_id)
+    assert stored["first_used_at"] is not None
+    assert stored["expires_at"] == me["pass"]["expires_at"]
+
+    # Subsequent validation does not extend the clock again.
+    again = (await client.get("/api/interviews")).status_code == 200
+    assert again is True
+    stored_after = await service.store.get_pass(issued_id)
+    assert stored_after["expires_at"] == stored["expires_at"]
+
+    # Long passes are untouched by activation: expiry stays as issued.
+    long_token, _ = await make_pass(service, kind="long", hours=1)
+    issued = (await service.store.list_passes())[-1]
+    long_expires_before = issued["expires_at"]
+    await login(client, "owner", token=long_token)
+    assert (await service.store.list_passes())[-1]["expires_at"] == long_expires_before

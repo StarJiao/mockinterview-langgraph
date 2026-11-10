@@ -165,12 +165,28 @@ def build_parser() -> argparse.ArgumentParser:
     score = subparsers.add_parser("score", help="对已结束面试的缺分题目单独补评")
     common(score, True)
     score.add_argument("session_id")
-    web = subparsers.add_parser("web", help="启动本机 Web 界面（无密码，按用户名分组）")
+    web = subparsers.add_parser("web", help="启动本机 Web 界面（凭访问令牌进入）")
     common(web, True)
     web.add_argument(
         "--host", default="0.0.0.0", help="监听地址；默认所有网卡，可用 127.0.0.1 收回"
     )
     web.add_argument("--port", type=int, default=8000, help="监听端口")
+    passes = subparsers.add_parser("pass", help="签发/管理 Web 访问令牌")
+    common(passes, True)
+    pass_sub = passes.add_subparsers(dest="pass_command", required=True)
+    pnew = pass_sub.add_parser("new", help="签发令牌")
+    common(pnew, True)
+    pnew.add_argument("--days", type=int, help="长期令牌有效期（天），不限配额")
+    pnew.add_argument("--hours", type=int, help="临时令牌有效期（小时），带 token 配额")
+    pnew.add_argument("--quota", type=int, help="临时令牌 token 配额，默认 300000")
+    pnew.add_argument("--count", type=int, default=1, help="一次签发数量，默认 1")
+    pnew.add_argument("--label", default="", help="备注（给谁用的）")
+    pnew.add_argument("--base-url", default="", help="拼接分享链接，例如 http://1.2.3.4")
+    plist = pass_sub.add_parser("list", help="列出全部令牌及用量")
+    common(plist, True)
+    prevoke = pass_sub.add_parser("revoke", help="立即作废一枚令牌")
+    common(prevoke, True)
+    prevoke.add_argument("pass_id", type=int)
     return parser
 
 
@@ -232,6 +248,91 @@ def resume_command(args, session_id: str) -> str:
     return shlex.join(pieces)
 
 
+async def pass_command(args, console: Console) -> int:
+    """Issue/list/revoke web access passes; needs no model backend or .env."""
+    import secrets
+
+    from datetime import timedelta, timezone
+
+    from .persistence import OperationStore, TEMP_PASS_DEFAULT_QUOTA
+
+    store = OperationStore(Path(args.data_dir) / "operations.sqlite")
+    Path(args.data_dir).mkdir(parents=True, exist_ok=True)
+    await store.open()
+    try:
+        if args.pass_command == "new":
+            if bool(args.days) == bool(args.hours):
+                raise ValueError("长期令牌用 --days，临时令牌用 --hours，二选一")
+            if args.days:
+                if args.days <= 0:
+                    raise ValueError("--days 必须大于 0")
+                kind, delta, quota = "long", timedelta(days=args.days), None
+            else:
+                if args.hours <= 0:
+                    raise ValueError("--hours 必须大于 0")
+                kind, delta = "temp", timedelta(hours=args.hours)
+                quota = args.quota if args.quota is not None else TEMP_PASS_DEFAULT_QUOTA
+                if quota <= 0:
+                    raise ValueError("--quota 必须大于 0")
+            count = max(1, args.count)
+            expires = (datetime.now(timezone.utc) + delta).isoformat()
+            ttl_seconds = int(delta.total_seconds()) if kind == "temp" else None
+            console.system(
+                f"签发 {count} 枚{'长期' if kind == 'long' else '临时'}令牌"
+                + (
+                    f" · 自首次使用起 {args.hours} 小时内有效"
+                    if kind == "temp"
+                    else f" · 有效期至 {expires}"
+                )
+                + (f" · 配额 {quota} token" if quota else " · 不限配额")
+            )
+            for _ in range(count):
+                token = secrets.token_urlsafe(24)
+                await store.create_pass(
+                    token,
+                    kind,
+                    expires,
+                    label=args.label,
+                    quota_tokens=quota,
+                    ttl_seconds=ttl_seconds,
+                )
+                suffix = f"?pass={token}"
+                url = f"{args.base_url.rstrip('/')}/{suffix}" if args.base_url else suffix
+                print(f"{token}\t{url}", flush=True)
+            if kind == "long":
+                console.system("长期令牌不限配额，请只给自己使用。")
+            else:
+                console.system("临时令牌到点自动失效；可随时用 pass revoke 立即作废。")
+            return 0
+        if args.pass_command == "list":
+            rows = await store.list_passes()
+            console.system("id\t类型\t用量/配额\t有效期至\t状态\t备注")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for row in rows:
+                quota = row["quota_tokens"]
+                usage = f"{row['used_tokens']}/{quota if quota is not None else '∞'}"
+                if row["revoked"]:
+                    state = "已作废"
+                elif row["kind"] == "temp" and row["first_used_at"] is None:
+                    state = "未激活（首次使用起计时）"
+                elif row["expires_at"] <= now_iso:
+                    state = "已过期"
+                else:
+                    state = "有效"
+                print(
+                    f"{row['id']}\t{row['kind']}\t{usage}\t"
+                    f"{row['expires_at'][:19].replace('T', ' ')}\t{state}\t{row['label']}"
+                )
+            return 0
+        # revoke
+        if not await store.revoke_pass(args.pass_id):
+            raise ValueError(f"不存在 id 为 {args.pass_id} 的令牌")
+        console.system(f"令牌 {args.pass_id} 已作废；持有者的下一次请求即被拒绝。")
+        return 0
+    finally:
+        await store.close()
+
+
 async def run(args) -> int:
     # Deferred imports allow --help and editor tests without provider/runtime initialization.
     from .models import DemoBackend, ModelBackend
@@ -239,6 +340,8 @@ async def run(args) -> int:
 
     console = Console()
     session_id = getattr(args, "session_id", None)
+    if args.command == "pass":
+        return await pass_command(args, console)
     config = Config.load(args.env)
     if args.command == "web":
         from .web import serve
@@ -264,7 +367,7 @@ async def run(args) -> int:
         shown_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
         console.system(
             f"Web 界面：http://{shown_host}:{args.port}（监听 {args.host}:{args.port}）；"
-            "用户名只用于区分数据，不是安全登录，请勿在不可信网络开放。"
+            "所有 API 凭访问令牌进入（pass new 签发），用户名只用于区分数据。"
         )
         await serve(
             backend, Path(args.data_dir), options_base, args.host, args.port, notify=console.system

@@ -7,8 +7,9 @@ stage_metrics holds duration and token usage for every real model call; it is
 diagnostic evidence for later inspection and never feeds back into the graph.
 """
 
+import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,6 +17,11 @@ import aiosqlite
 
 from .contracts import CallResult
 from .identity import CLI_USER
+
+TEMP_PASS_DEFAULT_QUOTA = 300_000
+"""Real-data baseline: one full 3-question interview with probes ≈ 114k tokens
+(≈ 38k per question, stage_metrics 2026-11). The default leaves room for
+several sessions or retries; override per pass with `pass new --quota`."""
 
 
 class OperationStore:
@@ -72,6 +78,24 @@ class OperationStore:
             );
             CREATE INDEX IF NOT EXISTS idx_stage_metrics_session
                 ON stage_metrics(session_id, id);
+            CREATE TABLE IF NOT EXISTS passes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                quota_tokens INTEGER,
+                ttl_seconds INTEGER,
+                first_used_at TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS pass_sessions (
+                pass_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                since TEXT NOT NULL,
+                PRIMARY KEY(pass_id, session_id)
+            );
         """)
         # Older databases predate the Web UI. Add the ownership column and give
         # every pre-existing session the CLI user; checkpoints stay untouched.
@@ -84,6 +108,19 @@ class OperationStore:
         await self.conn.execute(
             "UPDATE sessions SET username=? WHERE username='' OR username IS NULL",
             (CLI_USER,),
+        )
+        # Passes gained first-use activation. Backfill the TTL for rows issued
+        # before this change so their remaining validity can be recomputed.
+        async with self.conn.execute("PRAGMA table_info(passes)") as cur:
+            pass_columns = {row[1] for row in await cur.fetchall()}
+        if "ttl_seconds" not in pass_columns:
+            await self.conn.execute("ALTER TABLE passes ADD COLUMN ttl_seconds INTEGER")
+        if "first_used_at" not in pass_columns:
+            await self.conn.execute("ALTER TABLE passes ADD COLUMN first_used_at TEXT")
+        await self.conn.execute(
+            "UPDATE passes SET ttl_seconds = CAST("
+            "(julianday(expires_at) - julianday(created_at)) * 86400 AS INTEGER) "
+            "WHERE ttl_seconds IS NULL"
         )
         await self.conn.commit()
 
@@ -274,3 +311,148 @@ class OperationStore:
             (session_id,),
         ) as cur:
             return dict(await cur.fetchall())
+
+    # ------------------------------------------------------------------
+    # Access passes. Only the SHA-256 hash of a token is stored; the raw
+    # token exists exactly once — in the CLI output at issue time.
+    # ------------------------------------------------------------------
+
+    async def create_pass(
+        self,
+        token: str,
+        kind: str,
+        expires_at: str,
+        label: str = "",
+        quota_tokens: int | None = None,
+        ttl_seconds: int | None = None,
+    ) -> int:
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        await self.conn.execute(
+            "INSERT INTO passes(token_hash, kind, label, quota_tokens, ttl_seconds, "
+            "first_used_at, created_at, expires_at, revoked) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 0)",
+            (
+                token_hash,
+                kind,
+                label,
+                quota_tokens,
+                ttl_seconds,
+                datetime.now(timezone.utc).isoformat(),
+                expires_at,
+            ),
+        )
+        await self.conn.commit()
+        async with self.conn.execute(
+            "SELECT id FROM passes WHERE token_hash=?", (token_hash,)
+        ) as cur:
+            (pass_id,) = await cur.fetchone()
+        return pass_id
+
+    async def get_pass(self, pass_id: int) -> dict | None:
+        async with self.conn.execute(
+            "SELECT id, kind, label, quota_tokens, ttl_seconds, first_used_at, "
+            "created_at, expires_at, revoked FROM passes WHERE id=?",
+            (pass_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return self._pass_row(row) if row else None
+
+    async def pass_by_token(self, token: str) -> dict | None:
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        async with self.conn.execute(
+            "SELECT id, kind, label, quota_tokens, ttl_seconds, first_used_at, "
+            "created_at, expires_at, revoked FROM passes WHERE token_hash=?",
+            (token_hash,),
+        ) as cur:
+            row = await cur.fetchone()
+        return self._pass_row(row) if row else None
+
+    @staticmethod
+    def _pass_row(row) -> dict:
+        return {
+            "id": row[0],
+            "kind": row[1],
+            "label": row[2],
+            "quota_tokens": row[3],
+            "ttl_seconds": row[4],
+            "first_used_at": row[5],
+            "created_at": row[6],
+            "expires_at": row[7],
+            "revoked": bool(row[8]),
+        }
+
+    async def activate_pass(self, pass_row: dict) -> dict:
+        """Start a temp pass's clock on its first successful validation.
+
+        Issue time says nothing about when the guest actually opens the link,
+        so an unused pass keeps its full TTL: first validation stamps
+        first_used_at and moves expires_at to now + ttl. Long passes pass
+        through unchanged. The WHERE guard makes the first concurrent request
+        win; the result is re-read so callers see the definitive expiry.
+        """
+        if pass_row["kind"] != "temp" or pass_row["first_used_at"] is not None:
+            return pass_row
+        ttl = pass_row["ttl_seconds"]
+        if not ttl or ttl <= 0:
+            return pass_row
+        now = datetime.now(timezone.utc)
+        await self.conn.execute(
+            "UPDATE passes SET first_used_at=?, expires_at=? "
+            "WHERE id=? AND first_used_at IS NULL",
+            (
+                now.isoformat(),
+                (now + timedelta(seconds=ttl)).isoformat(),
+                pass_row["id"],
+            ),
+        )
+        await self.conn.commit()
+        return await self.get_pass(pass_row["id"]) or pass_row
+
+    async def revoke_pass(self, pass_id: int) -> bool:
+        cursor = await self.conn.execute(
+            "UPDATE passes SET revoked=1 WHERE id=?", (pass_id,)
+        )
+        await self.conn.commit()
+        return cursor.rowcount > 0
+
+    async def list_passes(self) -> list[dict]:
+        async with self.conn.execute(
+            "SELECT id, kind, label, quota_tokens, ttl_seconds, first_used_at, "
+            "created_at, expires_at, revoked FROM passes ORDER BY id"
+        ) as cur:
+            rows = await cur.fetchall()
+        result = []
+        for row in rows:
+            item = self._pass_row(row)
+            item["used_tokens"] = await self.pass_usage(row[0])
+            result.append(item)
+        return result
+
+    async def link_pass_session(self, pass_id: int, session_id: str) -> None:
+        """Attribute a session to a pass from now on. First link wins on `since`.
+
+        Re-links (a session resumed under a different pass) keep the earliest
+        timestamp, so per-pass usage sums never count the same call twice.
+        """
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO pass_sessions(pass_id, session_id, since) "
+            "VALUES (?, ?, ?)",
+            (pass_id, session_id, datetime.now(timezone.utc).isoformat()),
+        )
+        await self.conn.commit()
+
+    async def pass_usage(self, pass_id: int) -> int:
+        """Real model tokens burned by sessions linked to this pass.
+
+        stage_metrics is the single source of truth: usage sums rows whose
+        started_at is at or after the first link time, so scoring jobs that
+        finish after the turn are still counted.
+        """
+        async with self.conn.execute(
+            "SELECT COALESCE(SUM(sm.tokens), 0) FROM stage_metrics sm "
+            "JOIN pass_sessions ps ON ps.session_id = sm.session_id "
+            "AND ps.pass_id=? WHERE sm.started_at >= ps.since",
+            (pass_id,),
+        ) as cur:
+            (total,) = await cur.fetchone()
+        return int(total)

@@ -4,6 +4,7 @@ const sessionList = $('#session-list');
 
 const state = {
   user: null,
+  pass: null,
   topics: [],
   sessions: [],
   current: null,
@@ -55,6 +56,10 @@ async function api(path, options = {}) {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
+  if (response.status === 401 && !path.startsWith('/api/login')) {
+    // Pass expired or revoked mid-session: back to the login gate.
+    window.dispatchEvent(new CustomEvent('auth-lost'));
+  }
   const data = await response.json().catch(() => ({ detail: '响应不是 JSON' }));
   if (!response.ok) {
     const detail = data.detail;
@@ -400,6 +405,7 @@ async function refreshDetail() {
     state.lastBusy = detail.busy;
     state.error = '';
     render();
+    updatePassStatus();
     if (detail.done) await loadReport(true);
     await loadSessions();
     if (detail.busy || detail.scoring_pending) scheduleStatus();
@@ -426,10 +432,41 @@ async function openSession(id) {
   await refreshDetail();
 }
 
+function passStatusText(info) {
+  if (!info) return '';
+  if (info.kind !== 'temp') return '长期令牌 · 不限配额';
+  const remaining = Math.max(
+    0, Math.round((new Date(info.expires_at).getTime() - Date.now()) / 60000)
+  );
+  const minutes = remaining >= 60
+    ? `${Math.floor(remaining / 60)} 小时 ${remaining % 60} 分`
+    : `${remaining} 分钟`;
+  const used = info.used_tokens ?? 0;
+  const balance = info.quota_tokens != null
+    ? `余额 ${formatTokens(Math.max(0, info.quota_tokens - used))} token`
+    : `已用 ${formatTokens(used)} token`;
+  return `临时令牌 · 剩 ${minutes} · ${balance}`;
+}
+
+async function updatePassStatus() {
+  // Balance comes from stage_metrics sums, so it moves as the interview burns
+  // tokens; refresh it whenever the detail view catches a revision change.
+  try {
+    const me = await api('/api/me');
+    state.pass = me.pass;
+    const node = $('#pass-status');
+    if (node) node.textContent = passStatusText(state.pass);
+  } catch (_) {
+    // Auth loss is handled by the auth-lost event; ignore transient errors.
+  }
+}
+
 async function showMain() {
   $('#login-view').hidden = true;
   $('#main-view').hidden = false;
   $('#who').textContent = state.user;
+  $('#pass-status').textContent = passStatusText(state.pass);
+  updatePassStatus();
   await loadTopics();
   await loadSessions();
   render();
@@ -439,6 +476,7 @@ function showLogin() {
   $('#main-view').hidden = true;
   $('#login-view').hidden = false;
   state.user = null;
+  state.pass = null;
   state.current = null;
   state.view = 'empty';
 }
@@ -450,14 +488,23 @@ $('#login-form').addEventListener('submit', async (event) => {
   try {
     const result = await api('/api/login', {
       method: 'POST',
-      body: JSON.stringify({ username: $('#username').value }),
+      body: JSON.stringify({
+        username: $('#username').value,
+        pass_token: $('#pass-input').value,
+      }),
     });
     state.user = result.username;
+    const me = await api('/api/me');
+    state.pass = me.pass;
     await showMain();
   } catch (error) {
     box.textContent = error.message;
     box.hidden = false;
   }
+});
+
+window.addEventListener('auth-lost', () => {
+  if (state.user) showLogin();
 });
 
 $('#logout').addEventListener('click', async () => {
@@ -547,9 +594,22 @@ content.addEventListener('click', async (event) => {
 });
 
 (async () => {
+  const params = new URLSearchParams(window.location.search);
+  const urlPass = params.get('pass');
+  const tokenInput = $('#pass-input');
+  if (urlPass && tokenInput) {
+    tokenInput.value = urlPass;
+    $('#username').focus();
+  }
+  if (params.get('pass_error') && tokenInput) {
+    const box = $('#login-error');
+    box.textContent = '链接中的令牌无效或已过期，请联系作者重新获取。';
+    box.hidden = false;
+  }
   try {
     const result = await api('/api/me');
     state.user = result.username;
+    state.pass = result.pass;
     await showMain();
   } catch (error) {
     showLogin();

@@ -1,0 +1,17 @@
+[Unit]
+Description=Mock Interview web (uv + LangGraph)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/apps/mockinterview
+ExecStart=/home/lighthouse/.local/bin/uv run --locked mockinterview web --env .env --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+# Service binds to 127.0.0.1 only; public access goes through nginx on :80.
+
+[Install]
+WantedBy=multi-user.target

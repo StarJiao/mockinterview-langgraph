@@ -10,13 +10,15 @@
   <section id="login-view" class="login-wrap">
     <div class="login-card">
       <div class="brand big"><span class="brand-mark"></span>模拟面试</div>
-      <p class="muted">本机运行 · 填写用户名即可进入，不设密码</p>
+      <p class="muted">凭访问令牌进入 · 用户名只用于区分数据</p>
       <form id="login-form">
+        <label for="pass-input">访问令牌</label>
+        <input id="pass-input" name="pass_token" type="text" autocomplete="off" placeholder="粘贴作者给你的令牌（链接可自动带入）">
         <label for="username">用户名</label>
         <input id="username" name="username" type="text" maxlength="32" autocomplete="off" placeholder="例如：焦明星">
         <button class="primary full" type="submit">进入</button>
       </form>
-      <p class="hint">用户名只用于区分数据：填同一个名字就能看到同一批会话，这不是安全登录。服务默认监听所有网卡，同网段的人也能访问；请只在可信网络使用，勿在此存放敏感资料。</p>
+      <p class="hint">令牌由作者签发：临时令牌从你第一次进入时开始计时，长期令牌不限配额。用户名可随意填写，只用于区分各自的数据，不是身份验证。</p>
       <p id="login-error" class="error" hidden></p>
     </div>
   </section>
@@ -25,6 +27,7 @@
     <header class="topbar">
       <div class="brand"><span class="brand-mark"></span>模拟面试</div>
       <div class="topright">
+        <span class="who" id="pass-status"></span>
         <span class="who" id="who"></span>
         <button class="ghost" id="logout" type="button">退出</button>
       </div>

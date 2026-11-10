@@ -1,22 +1,31 @@
 """Local Web UI over the same LangGraph runtime as the CLI.
 
-A username is a data grouping label, not authentication: there is no password,
-and anyone who types the same name sees the same sessions. The server binds to
-all interfaces by default; --host 127.0.0.1 restricts it. All interview rules
-live in the graph; this layer only drives it.
+Access control is a two-layer split:
+
+- The pass cookie gates the whole /api surface. Passes are issued by the CLI
+  (`mockinterview pass new`): long-lived ones for the owner, temp ones with a
+  token quota for guests. Only the SHA-256 hash of a token is stored.
+- The username cookie is still just a data grouping label: any name entered
+  with a valid pass is created on first use.
+
+Model-consuming operations (create / answer / resume) additionally require
+temp-pass quota headroom; reads and history stay open after exhaustion.
+
+The server binds to all interfaces by default; --host 127.0.0.1 restricts it.
+All interview rules live in the graph; this layer only drives it.
 """
 
 import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 from urllib.parse import quote, unquote
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .report import render_report
@@ -26,6 +35,8 @@ from .telemetry import StageTracker
 
 STATIC_DIR = Path(__file__).parent / "web_static"
 COOKIE = "mi_user"
+PASS_COOKIE = "mi_pass"
+LONG_PASS_MAX_AGE = 365 * 24 * 3600
 USERNAME_RE = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff .-]{0,31}$")
 
 TOPICS = [
@@ -43,6 +54,7 @@ TOPICS = [
 
 class LoginBody(BaseModel):
     username: str = ""
+    pass_token: str = ""
 
 
 class NewInterviewBody(BaseModel):
@@ -253,6 +265,70 @@ async def current_user(request: Request, service: WebService = Depends(service_o
     return username
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def pass_is_valid(pass_row: dict) -> bool:
+    if pass_row is None or pass_row["revoked"]:
+        return False
+    try:
+        expires = datetime.fromisoformat(pass_row["expires_at"])
+    except ValueError:
+        return False
+    return expires > _utcnow()
+
+
+async def fetch_pass(token: str, service: WebService) -> dict | None:
+    """Look up a raw token and start its clock if this is its first use.
+
+    Every entry point (gate middleware, login, exchange route) must come
+    through here so an unused temp pass gets its full TTL from first contact.
+    """
+    if not token:
+        return None
+    pass_row = await service.store.pass_by_token(token)
+    if pass_row is None:
+        return None
+    return await service.store.activate_pass(pass_row)
+
+
+def pass_max_age(pass_row: dict) -> int:
+    """Cookie lifetime = remaining validity; temp passes die with the pass."""
+    expires = datetime.fromisoformat(pass_row["expires_at"])
+    remaining = int((expires - _utcnow()).total_seconds())
+    if pass_row["kind"] == "long":
+        return min(remaining, LONG_PASS_MAX_AGE)
+    return max(remaining, 0)
+
+
+def pass_info(pass_row: dict, used_tokens: int | None = None) -> dict:
+    info = {
+        "kind": pass_row["kind"],
+        "label": pass_row["label"],
+        "expires_at": pass_row["expires_at"],
+        "quota_tokens": pass_row["quota_tokens"],
+    }
+    if pass_row["kind"] == "temp":
+        info["used_tokens"] = used_tokens
+    return info
+
+
+async def require_write_quota(pass_row: dict, service: WebService) -> None:
+    """Temp passes need quota headroom for anything that calls the models."""
+    if pass_row["kind"] != "temp" or pass_row["quota_tokens"] is None:
+        return
+    used = await service.store.pass_usage(pass_row["id"])
+    if used >= pass_row["quota_tokens"]:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "令牌配额已用完：可继续查看历史与报告，继续面试需要向作者索取新令牌",
+                "quota_exhausted": True,
+            },
+        )
+
+
 async def require_owned(session_id: str, username: str, service: WebService):
     owner = await service.store.owner(session_id)
     if owner is None or owner != username:
@@ -308,6 +384,28 @@ def create_app(service: WebService) -> FastAPI:
     app = FastAPI(title="Mock Interview", lifespan=lifespan)
     app.state.service = service
 
+    @app.middleware("http")
+    async def pass_gate(request: Request, call_next):
+        """One gate for the whole /api surface; the pass cookie is the door.
+
+        /api/login carries the token in its body, static pages must load so the
+        login form can be shown at all — everything else needs a valid pass.
+        The validated row is stashed on request.state for quota checks.
+        """
+        path = request.url.path
+        if path.startswith("/api/") and path != "/api/login":
+            raw = request.cookies.get(PASS_COOKIE)
+            pass_row = await fetch_pass(raw, service)
+            if not pass_is_valid(pass_row):
+                detail = (
+                    "访问令牌无效或已过期，请联系作者重新获取"
+                    if raw
+                    else "需要访问令牌：请通过带 ?pass= 的链接进入，或在登录框填入令牌"
+                )
+                return JSONResponse({"detail": detail}, status_code=401)
+            request.state.pass_row = pass_row
+        return await call_next(request)
+
     @app.get("/")
     async def index():
         return FileResponse(STATIC_DIR / "index.html")
@@ -332,10 +430,20 @@ def create_app(service: WebService) -> FastAPI:
                 status_code=400,
                 detail="用户名需为 1–32 个中英文、数字、空格、点或连字符，且不能以符号开头",
             )
+        token = body.pass_token.strip()
+        pass_row = await fetch_pass(token, service)
+        if not pass_is_valid(pass_row):
+            raise HTTPException(
+                status_code=401, detail="令牌无效或已过期，请联系作者重新获取"
+            )
         await service.store.ensure_user(username)
         response = JSONResponse({"username": username})
         response.set_cookie(
             COOKIE, quote(username, safe=""), httponly=True, samesite="lax", path="/"
+        )
+        response.set_cookie(
+            PASS_COOKIE, token, httponly=True, samesite="lax", path="/",
+            max_age=pass_max_age(pass_row),
         )
         return response
 
@@ -343,11 +451,41 @@ def create_app(service: WebService) -> FastAPI:
     async def logout():
         response = JSONResponse({"ok": True})
         response.delete_cookie(COOKIE, path="/")
+        response.delete_cookie(PASS_COOKIE, path="/")
+        return response
+
+    @app.get("/pass/{token}")
+    async def exchange_pass(token: str, service: WebService = Depends(service_of)):
+        """Validate the URL token up front, then hand it back to the login form.
+
+        The pass cookie alone cannot complete login (the username cookie is
+        separate), and the form cannot read an httponly cookie — so the token
+        rides one more hop via ?pass= for the frontend to prefill.
+        """
+        token = token.strip()
+        pass_row = await fetch_pass(token, service)
+        if not pass_is_valid(pass_row):
+            return RedirectResponse("/?pass_error=1", status_code=302)
+        response = RedirectResponse(f"/?pass={token}", status_code=302)
+        response.set_cookie(
+            PASS_COOKIE, token, httponly=True, samesite="lax", path="/",
+            max_age=pass_max_age(pass_row),
+        )
         return response
 
     @app.get("/api/me")
-    async def me(username: str = Depends(current_user)):
-        return {"username": username}
+    async def me(
+        request: Request,
+        username: str = Depends(current_user),
+        service: WebService = Depends(service_of),
+    ):
+        pass_row = request.state.pass_row
+        used = (
+            await service.store.pass_usage(pass_row["id"])
+            if pass_row["kind"] == "temp"
+            else None
+        )
+        return {"username": username, "pass": pass_info(pass_row, used)}
 
     @app.get("/api/interviews")
     async def list_interviews(
@@ -359,9 +497,11 @@ def create_app(service: WebService) -> FastAPI:
     @app.post("/api/interviews", status_code=202)
     async def new_interview(
         body: NewInterviewBody,
+        request: Request,
         username: str = Depends(current_user),
         service: WebService = Depends(service_of),
     ):
+        await require_write_quota(request.state.pass_row, service)
         topic = body.topic.strip()
         if not topic or len(topic) > 60:
             raise HTTPException(status_code=400, detail="主题为必填项，且不超过 60 字")
@@ -384,6 +524,7 @@ def create_app(service: WebService) -> FastAPI:
         }
         session_id = f"mock-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:6]}"
         await service.store.register(session_id, username)
+        await service.store.link_pass_session(request.state.pass_row["id"], session_id)
         await service.store.add_event(
             session_id,
             "start",
@@ -475,10 +616,12 @@ def create_app(service: WebService) -> FastAPI:
     async def answer(
         session_id: str,
         body: AnswerBody,
+        request: Request,
         username: str = Depends(current_user),
         service: WebService = Depends(service_of),
     ):
         await require_owned(session_id, username, service)
+        await require_write_quota(request.state.pass_row, service)
         turn = await inspect_or_retry(session_id, service)
         ensure_backend_match(turn, service)
         if turn.done:
@@ -492,6 +635,7 @@ def create_app(service: WebService) -> FastAPI:
             )
         if len(body.answer) > 20000:
             raise HTTPException(status_code=400, detail="回答过长（上限 20000 字）")
+        await service.store.link_pass_session(request.state.pass_row["id"], session_id)
         await service.store.add_event(
             session_id, pending_anchor(turn), "候选人已提交本轮回答，等待生成下一步"
         )
@@ -503,16 +647,19 @@ def create_app(service: WebService) -> FastAPI:
     @app.post("/api/interviews/{session_id}/resume", status_code=202)
     async def resume(
         session_id: str,
+        request: Request,
         username: str = Depends(current_user),
         service: WebService = Depends(service_of),
     ):
         await require_owned(session_id, username, service)
+        await require_write_quota(request.state.pass_row, service)
         turn = await inspect_or_retry(session_id, service)
         ensure_backend_match(turn, service)
         if turn.done:
             raise HTTPException(status_code=409, detail="面试已完成，只能查看报告，不能继续")
         if service.busy(session_id):
             raise HTTPException(status_code=409, detail="这场面试正在处理上一轮，请稍候")
+        await service.store.link_pass_session(request.state.pass_row["id"], session_id)
         await service.store.add_event(session_id, "end", "已恢复未完成步骤，继续推进流程")
         await service.launch(session_id, lambda: service.app.resume(session_id))
         return {"id": session_id, "busy": True}

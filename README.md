@@ -36,12 +36,59 @@ uv run mockinterview web --demo --port 8000
 uv run mockinterview web --env .env --port 8000
 ```
 
+## 服务器部署
+
+代码走 GitHub：本地 `git push`，服务器 `git pull` + `scripts/deploy.sh`。
+
+首次部署（Debian 13，用户 `lighthouse`）：
+
+```sh
+# 1. 安装 uv（或 pip install --user uv）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. 拉代码、放密钥（.env 不入库，单独传）
+mkdir -p ~/apps && cd ~/apps
+git clone git@github.com:StarJiao/mockinterview-langgraph.git
+cd mockinterview-langgraph && uv sync --locked
+# 把 .env 放到仓库根目录（含模型密钥）
+
+# 3. systemd 与 nginx 配置见 deploy/ 目录，复制后启用：
+sudo cp deploy/mockinterview.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now mockinterview
+sudo cp deploy/nginx-mockinterview.conf /etc/nginx/sites-available/mockinterview
+sudo ln -sf /etc/nginx/sites-available/mockinterview /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+日常更新：`./scripts/deploy.sh`（拉代码 → 同步依赖 → 重启服务）。
+
+## 访问令牌（pass）
+
+站点凭令牌进入，签发与管理办法（`pass` 子命令不需要模型密钥）：
+
+```sh
+# 给自己：长期令牌，不限配额
+uv run mockinterview pass new --days 365 --base-url http://152.136.173.194
+
+# 给朋友：临时令牌，自首次使用起 1 小时有效 + 300000 token 配额，批量 5 枚
+uv run mockinterview pass new --hours 1 --count 5 --label 朋友 --base-url http://152.136.173.194
+
+# 自定义配额 / 查看用量 / 立即作废
+uv run mockinterview pass new --hours 2 --quota 100000
+uv run mockinterview pass list
+uv run mockinterview pass revoke <id>
+```
+
+`--base-url` 会直接拼出可分享的 `http://…/?pass=TOKEN` 链接；不加则只输出令牌本体。临时令牌从**首次使用**起计时，`pass list` 中显示「未激活」的令牌尚未开始计时；配额按 `stage_metrics` 真实用量汇总（含后台评分），耗尽后只能查看，继续面试需要新令牌。
+
 默认监听 `0.0.0.0`，可用同一网段任意设备的浏览器访问 `http://<本机局域网 IP>:8000`；本机也可用 `http://127.0.0.1:8000`。想收回本机访问用 `--host 127.0.0.1`。
 
-**安全边界**：没有密码，用户名只是分组标签。服务开放到局域网后，**同网段任何人填同一个用户名就能看到该名下的简历、JD 和问答原文，并且能继续作答、消耗模型额度**。只在可信网络使用，不要映射到公网；需要隔离时请自行加一层带认证的反向代理，本项目不提供鉴权。
+**安全边界**：所有 `/api/*` 凭**访问令牌**进入（`pass new` 签发，只存 SHA-256 哈希）。长期令牌（`--days`）不限配额，给所有者自用；临时令牌（`--hours`）**自首次使用起计时**（未激活的令牌不缩水），带 token 配额（默认 300000，约两场三题面试），到期或配额用完后只能查看历史与报告，继续面试需要新令牌。用户名仍只是数据分组标签：凭同一枚令牌填任意用户名即自动创建，同名看到同一批会话（含简历和问答原文）。服务开放到公网前务必确认只把令牌发给信任的人。
 `--data-dir` / `--output-dir` 默认是相对**当前工作目录**的 `data` / `outputs`：在项目根目录启动就读写本项目已有的会话与报告，从别的目录启动会各自新建一套；要固定位置就显式传路径。
 
-- **登录**：只填用户名，不设密码。用户名只是数据分组标签，**不是身份鉴权**——填同一个名字就能看到同一批会话，包括简历和问答原文。`cli` 是命令行的固定用户名：命令行新建的会话、以及升级前已有的历史会话都归 `cli`；Web 新建的会话归登录时填的用户名。在 Web 登录框填 `cli` 就能查看这批命令行会话（含旧历史），普通用户名之间互相不可见。两个前端因此可以共用同一个 `--data-dir`，不需要拆分目录。
+- **登录**：填用户名 + 访问令牌。令牌由 `pass new` 签发，可经 `?pass=` 链接自动带入（服务端先校验再种 http-only cookie）。用户名只是数据分组标签，**不是身份鉴权**——凭同一枚令牌填同一个名字就能看到同一批会话，包括简历和问答原文。`cli` 是命令行的固定用户名：命令行新建的会话、以及升级前已有的历史会话都归 `cli`；Web 新建的会话归登录时填的用户名。在 Web 登录框填 `cli` 就能查看这批命令行会话（含旧历史），普通用户名之间互相不可见。两个前端因此可以共用同一个 `--data-dir`，不需要拆分目录。
+- **访问令牌**：`uv run mockinterview pass new --hours 1 --count 5 --label 朋友` 批量签发临时令牌（1 小时 + 配额），`--days 365` 签发不限配额的长期令牌，`--base-url http://IP` 直接输出可分享的 `?pass=` 链接；`pass list` 查看用量，`pass revoke <id>` 立即作废。临时令牌自**首次使用**起计时（`pass list` 显示「未激活」直到被首次使用），配额按「令牌 → 会话」归属从 `stage_metrics` 真实用量汇总（含后台评分），页面顶栏实时显示剩余余额；耗尽后新建/作答/恢复被拒（403），查看与切换用户不受限；拿到新令牌登录后可继续未完成的面试。
 - **新建面试**：主题、题目数量为必填（1–10 题），前后端都会校验；主题可从预设下拉选，也可自己填。简历可选，目标 JD 可添加多份（最多 5 份），全部可留空。多个 JD 会以编号形式一起进入选题提示词，旧会话的单 `jd` 字符串行为不变。
 - **面试过程**：沿用 CLI 的同一张图和全部约束（追问 3 次、澄清 1 次、低覆盖补充机会、空回答二次确认、证据不足不填零）。信息流按 **系统 / 面试官 / 候选人** 三种角色区分，候选人用蓝色底色与面试官的青绿拉开：问答与收尾来自 checkpoint，系统消息来自已保存的决策、评分状态和界面运行记录。提交回答后由后台任务推进，不会因刷新丢失已提交内容。
 - **轮询与耗时**：心跳只请求 `/api/interviews/{id}/status`，返回由三条索引计数（模型结果收据、界面事件、阶段指标）构成的 `revision`、`busy`、后台评分是否仍在跑，以及当前阶段与已用时；只有 `revision` 变化或本轮结束时才拉完整详情，不每次重建整页。等待期间显示 loading 动画和「当前阶段：快评决策 / 生成追问 / 单题评分…」。
