@@ -48,7 +48,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2. 拉代码、放密钥（.env 不入库，单独传）
 mkdir -p ~/apps && cd ~/apps
-git clone git@github.com:StarJiao/mockinterview-langgraph.git
+git clone https://github.com/StarJiao/mockinterview-langgraph.git
 cd mockinterview-langgraph && uv sync --locked
 # 把 .env 放到仓库根目录（含模型密钥）
 
