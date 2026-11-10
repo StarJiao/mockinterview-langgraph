@@ -338,6 +338,26 @@ def test_web_defaults_to_all_interfaces():
     args = build_parser().parse_args(["web"])
     assert args.host == "0.0.0.0"
     assert args.port == 8000
+    assert args.secure_cookie is False
+
+
+async def test_secure_cookie_flag_marks_cookies_when_enabled(tmp_path):
+    service = WebService(
+        DemoBackend(), tmp_path, {**OPTIONS_BASE, "secure_cookies": True},
+        notify=lambda _: None,
+    )
+    application = create_app(service)
+    async with application.router.lifespan_context(application):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="http://test"
+        ) as client:
+            token, _ = await make_pass(service)
+            response = await client.post(
+                "/api/login", json={"username": "alice", "pass_token": token}
+            )
+            assert response.status_code == 200
+            set_cookie = response.headers.get("set-cookie", "")
+            assert "Secure" in set_cookie and "mi_pass=" in set_cookie
 
 
 class CapturingModel:

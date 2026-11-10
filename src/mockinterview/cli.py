@@ -171,6 +171,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--host", default="0.0.0.0", help="监听地址；默认所有网卡，可用 127.0.0.1 收回"
     )
     web.add_argument("--port", type=int, default=8000, help="监听端口")
+    web.add_argument(
+        "--secure-cookie",
+        action="store_true",
+        default=False,
+        help="HTTPS 站点使用：给 cookie 加 Secure 标记（HTTP 下加了会登录不上）",
+    )
     passes = subparsers.add_parser("pass", help="签发/管理 Web 访问令牌")
     common(passes, True)
     pass_sub = passes.add_subparsers(dest="pass_command", required=True)
@@ -363,6 +369,7 @@ async def run(args) -> int:
             "prompt_version": "original",
             "questioner_model": "demo" if args.demo else config.questioner_model,
             "evaluator_model": "demo" if args.demo else config.evaluator_model,
+            "secure_cookies": args.secure_cookie,
         }
         shown_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
         console.system(

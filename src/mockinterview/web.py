@@ -193,6 +193,9 @@ class WebService:
         self.backend = backend
         self.data_dir = Path(data_dir)
         self.options_base = dict(options_base)
+        # Cookies must carry Secure once the site is served over HTTPS;
+        # the CLI flips this via --secure-cookie (no-op on plain HTTP).
+        self.secure_cookies = bool(self.options_base.get("secure_cookies", False))
         self.notify = notify or (lambda text: print(f"[系统] {str(text).replace(chr(27), '')}"))
         self.tasks: dict[str, asyncio.Task] = {}
         self.locks: dict[str, asyncio.Lock] = {}
@@ -439,11 +442,12 @@ def create_app(service: WebService) -> FastAPI:
         await service.store.ensure_user(username)
         response = JSONResponse({"username": username})
         response.set_cookie(
-            COOKIE, quote(username, safe=""), httponly=True, samesite="lax", path="/"
+            COOKIE, quote(username, safe=""), httponly=True, samesite="lax", path="/",
+            secure=service.secure_cookies,
         )
         response.set_cookie(
             PASS_COOKIE, token, httponly=True, samesite="lax", path="/",
-            max_age=pass_max_age(pass_row),
+            max_age=pass_max_age(pass_row), secure=service.secure_cookies,
         )
         return response
 
@@ -469,7 +473,7 @@ def create_app(service: WebService) -> FastAPI:
         response = RedirectResponse(f"/?pass={token}", status_code=302)
         response.set_cookie(
             PASS_COOKIE, token, httponly=True, samesite="lax", path="/",
-            max_age=pass_max_age(pass_row),
+            max_age=pass_max_age(pass_row), secure=service.secure_cookies,
         )
         return response
 
