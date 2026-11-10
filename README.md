@@ -68,11 +68,11 @@ sudo nginx -t && sudo systemctl reload nginx
 站点凭令牌进入，签发与管理办法（`pass` 子命令不需要模型密钥）：
 
 ```sh
-# 给自己：长期令牌，不限配额
-uv run mockinterview pass new --days 365 --base-url http://152.136.173.194
+# 给自己：长期令牌，不限配额（--base-url 填站点地址，例如 http://你的IP）
+uv run mockinterview pass new --days 365 --base-url http://<站点地址>
 
 # 给朋友：临时令牌，自首次使用起 1 小时有效 + 300000 token 配额，批量 5 枚
-uv run mockinterview pass new --hours 1 --count 5 --label 朋友 --base-url http://152.136.173.194
+uv run mockinterview pass new --hours 1 --count 5 --label 朋友 --base-url http://<站点地址>
 
 # 自定义配额 / 查看用量 / 立即作废
 uv run mockinterview pass new --hours 2 --quota 100000
