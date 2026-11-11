@@ -81,6 +81,7 @@ class OperationStore:
             CREATE TABLE IF NOT EXISTS passes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token_hash TEXT NOT NULL UNIQUE,
+                token_plain TEXT,
                 kind TEXT NOT NULL,
                 label TEXT NOT NULL DEFAULT '',
                 quota_tokens INTEGER,
@@ -117,6 +118,8 @@ class OperationStore:
             await self.conn.execute("ALTER TABLE passes ADD COLUMN ttl_seconds INTEGER")
         if "first_used_at" not in pass_columns:
             await self.conn.execute("ALTER TABLE passes ADD COLUMN first_used_at TEXT")
+        if "token_plain" not in pass_columns:
+            await self.conn.execute("ALTER TABLE passes ADD COLUMN token_plain TEXT")
         await self.conn.execute(
             "UPDATE passes SET ttl_seconds = CAST("
             "(julianday(expires_at) - julianday(created_at)) * 86400 AS INTEGER) "
@@ -328,11 +331,12 @@ class OperationStore:
     ) -> int:
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         await self.conn.execute(
-            "INSERT INTO passes(token_hash, kind, label, quota_tokens, ttl_seconds, "
-            "first_used_at, created_at, expires_at, revoked) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 0)",
+            "INSERT INTO passes(token_hash, token_plain, kind, label, quota_tokens, "
+            "ttl_seconds, first_used_at, created_at, expires_at, revoked) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0)",
             (
                 token_hash,
+                token,
                 kind,
                 label,
                 quota_tokens,
@@ -351,7 +355,7 @@ class OperationStore:
     async def get_pass(self, pass_id: int) -> dict | None:
         async with self.conn.execute(
             "SELECT id, kind, label, quota_tokens, ttl_seconds, first_used_at, "
-            "created_at, expires_at, revoked FROM passes WHERE id=?",
+            "created_at, expires_at, revoked, token_plain FROM passes WHERE id=?",
             (pass_id,),
         ) as cur:
             row = await cur.fetchone()
@@ -361,7 +365,7 @@ class OperationStore:
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         async with self.conn.execute(
             "SELECT id, kind, label, quota_tokens, ttl_seconds, first_used_at, "
-            "created_at, expires_at, revoked FROM passes WHERE token_hash=?",
+            "created_at, expires_at, revoked, token_plain FROM passes WHERE token_hash=?",
             (token_hash,),
         ) as cur:
             row = await cur.fetchone()
@@ -379,6 +383,9 @@ class OperationStore:
             "created_at": row[6],
             "expires_at": row[7],
             "revoked": bool(row[8]),
+            # Plaintext copy kept so `pass list` can show it; NULL for rows
+            # issued before this column existed (hash-only, unrecoverable).
+            "token": row[9],
         }
 
     async def activate_pass(self, pass_row: dict) -> dict:
@@ -418,7 +425,7 @@ class OperationStore:
     async def list_passes(self) -> list[dict]:
         async with self.conn.execute(
             "SELECT id, kind, label, quota_tokens, ttl_seconds, first_used_at, "
-            "created_at, expires_at, revoked FROM passes ORDER BY id"
+            "created_at, expires_at, revoked, token_plain FROM passes ORDER BY id"
         ) as cur:
             rows = await cur.fetchall()
         result = []

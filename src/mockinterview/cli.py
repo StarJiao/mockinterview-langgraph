@@ -312,7 +312,7 @@ async def pass_command(args, console: Console) -> int:
             return 0
         if args.pass_command == "list":
             rows = await store.list_passes()
-            console.system("id\t类型\t用量/配额\t有效期至\t状态\t备注")
+            console.system("id\t类型\t令牌\t用量/配额\t有效期至\t状态\t备注")
             now_iso = datetime.now(timezone.utc).isoformat()
             for row in rows:
                 quota = row["quota_tokens"]
@@ -325,8 +325,9 @@ async def pass_command(args, console: Console) -> int:
                     state = "已过期"
                 else:
                     state = "有效"
+                token = row["token"] or "（旧令牌仅存哈希，无法显示）"
                 print(
-                    f"{row['id']}\t{row['kind']}\t{usage}\t"
+                    f"{row['id']}\t{row['kind']}\t{token}\t{usage}\t"
                     f"{row['expires_at'][:19].replace('T', ' ')}\t{state}\t{row['label']}"
                 )
             return 0

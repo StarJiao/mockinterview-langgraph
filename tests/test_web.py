@@ -543,6 +543,15 @@ async def test_temp_pass_quota_blocks_model_work_but_reads_stay_open(web):
     assert (await new_interview(client)).status_code == 202
 
 
+async def test_pass_list_carries_the_raw_token_for_reissue(web):
+    _, service, _ = web
+    token, pass_id = await make_pass(service, kind="temp", hours=1, quota=1000)
+    rows = {row["id"]: row for row in await service.store.list_passes()}
+    assert rows[pass_id]["token"] == token
+    # Login still resolves through the hash, not the plaintext copy.
+    assert (await service.store.pass_by_token(token))["id"] == pass_id
+
+
 async def test_temp_pass_clock_starts_on_first_use_not_at_issue_time(web):
     client, service, _ = web
     token, _ = await make_pass(service, kind="temp", hours=1)
