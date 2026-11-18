@@ -172,3 +172,8 @@ button { cursor: pointer; }
   .sidebar { width: 100%; position: static; }
   .session-list { max-height: 220px; }
 }
+
+
+.interview-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.interview-heading h2 { margin: 0; }
+.clean-toggle[aria-checked="true"] { color: var(--accent); background: var(--accent-soft); border-color: #b9ddd7; }

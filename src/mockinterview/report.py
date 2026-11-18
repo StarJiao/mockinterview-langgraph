@@ -28,30 +28,6 @@ def _evaluation_dimensions(evaluation: dict) -> list[dict]:
     return []
 
 
-def render_overall_summary(state: dict) -> list[str]:
-    """Whole-session numbers; derived from saved facts, no new model call."""
-    questions = state.get("questions", [])
-    evaluations = state.get("evaluations", {})
-    done = sum(q.get("status") == "done" for q in questions)
-    lines = [
-        "## 整场汇总",
-        "",
-        f"已完成 {done} 题，已收集 {len(evaluations)} 份单题评分。",
-    ]
-    missing = sum(
-        q.get("status") == "done" and q["id"] not in evaluations for q in questions
-    )
-    if missing:
-        lines.append(f"尚有 {missing} 题未评分，可使用 score 命令补评。")
-    lines.extend(
-        [
-            "以上为单题评分汇总，未额外调用模型生成整场评价。",
-            "",
-        ]
-    )
-    return lines
-
-
 def render_review_advice(state: dict) -> list[str]:
     """Derive a revision priority from saved scores; never invent a judgement."""
     questions = state.get("questions", [])
@@ -156,7 +132,6 @@ def render_report(state: dict) -> str:
         ]
     )
     # Conclusion first: the per-question detail below can be very long.
-    lines.extend(render_overall_summary(state))
     lines.extend(render_review_advice(state))
     lines.append("## 逐题记录与评分")
     for index, question in enumerate(questions, 1):

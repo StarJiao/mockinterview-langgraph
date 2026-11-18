@@ -101,7 +101,6 @@ def test_conclusion_sections_come_before_the_long_detail():
     text = render_report(make_state({}))
     positions = [
         text.index("# 模拟面试报告"),
-        text.index("## 整场汇总"),
         text.index("## 后续复习建议"),
         text.index("## 逐题记录与评分"),
         text.index("### 1."),
@@ -110,10 +109,11 @@ def test_conclusion_sections_come_before_the_long_detail():
     assert text.index("**候选人**") > text.index("## 逐题记录与评分")
 
 
-def test_summary_still_reports_missing_scores_before_detail():
+def test_report_omits_overall_summary_but_keeps_question_scoring_status():
     text = render_report(make_state({"s-q1": {"score": "12/20", "judge_text": ""}}))
-    assert "尚有 1 题未评分" in text
-    assert text.index("尚有 1 题未评分") < text.index("## 逐题记录与评分")
+    assert "## 整场汇总" not in text
+    assert "已收集" not in text
+    assert "（尚未评分）" in text
 
 
 def test_question_feedback_precedes_collapsed_records_and_scores():

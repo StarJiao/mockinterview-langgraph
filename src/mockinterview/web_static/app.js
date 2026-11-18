@@ -15,6 +15,7 @@ const state = {
   error: '',
   emptyConfirm: false,
   clearDraft: false,
+  cleanMode: true,
   reportHtml: '',
   reportFor: null,
   revision: null,
@@ -276,7 +277,9 @@ function renderDetail(detail) {
   ].map(([label, value]) =>
     `<span class="meta-chip">${escapeHtml(label)}<b>${escapeHtml(value)}</b></span>`
   ).join('');
-  const messages = (detail.messages || []).map(renderMessage).join('')
+  const messages = (detail.messages || [])
+    .filter((message) => !state.cleanMode || ['interviewer', 'candidate'].includes(message.role))
+    .map(renderMessage).join('')
     || '<div class="loading">正在准备题目…</div>';
   let bottom = '';
   if (detail.done) {
@@ -286,13 +289,13 @@ function renderDetail(detail) {
           ? state.reportHtml : '<div class="loading">正在读取报告…</div>'}</div>
       </div>`;
   } else if (detail.busy) {
-    bottom = `${notice('面试官正在思考，结束后页面会自动刷新。')}
+    bottom = `${state.cleanMode ? '' : notice('面试官正在思考，结束后页面会自动刷新。')}
       <div class="card">
-        <div class="working">
+        <div class="working" role="status" aria-live="polite">
           <span class="spinner" aria-hidden="true"></span>
-          <span class="working-text">请稍候，模型调用可能持续数十秒。</span>
+          <span class="working-text">${state.cleanMode ? '面试官正在思考，请稍候…' : '请稍候，模型调用可能持续数十秒。'}</span>
         </div>
-        <div class="stage-line" id="stage-line">${escapeHtml(stageText())}</div>
+        ${state.cleanMode ? '' : `<div class="stage-line" id="stage-line">${escapeHtml(stageText())}</div>`}
       </div>`;
   } else if (detail.pending) {
     const pending = detail.pending;
@@ -320,13 +323,19 @@ function renderDetail(detail) {
     </div>`;
   }
   return `<div class="card">
-      <h2>面试信息流</h2>
-      <p class="card-sub">系统、面试官、候选人分角色展示。系统、面试官与评分约束沿用 CLI 的同一张图。</p>
+      <div class="interview-heading">
+        <h2>面试对话</h2>
+        <button class="ghost clean-toggle" type="button" data-action="toggle-clean"
+          role="switch" aria-checked="${state.cleanMode}" aria-label="纯净模式">
+          纯净模式：${state.cleanMode ? '开启' : '关闭'}
+        </button>
+      </div>
+      ${state.cleanMode ? '' : '<p class="card-sub">展示完整系统提示、对话及运行统计。</p>'}
       <div class="meta-grid">${chips}</div>
     </div>
     <div class="card"><div class="stream">${messages}</div></div>
     ${bottom}
-    ${renderMetrics(detail)}`;
+    ${state.cleanMode ? '' : renderMetrics(detail)}`;
 }
 
 function render() {
@@ -540,7 +549,11 @@ content.addEventListener('click', async (event) => {
   if (!button) return;
   const action = button.dataset.action;
   try {
-    if (action === 'cancel') {
+    if (action === 'toggle-clean') {
+      state.cleanMode = !state.cleanMode;
+      render();
+      content.querySelector('[data-action="toggle-clean"]').focus();
+    } else if (action === 'cancel') {
       state.view = 'empty';
       state.error = '';
       render();
