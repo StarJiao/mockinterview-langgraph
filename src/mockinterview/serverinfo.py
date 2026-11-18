@@ -747,7 +747,7 @@ def render_server_page(info: dict) -> str:
     <div class="meta">
       <span class="readonly">只读 · 每页自动刷新（{REFRESH_SECONDS}s）</span>
       生成于 {esc(info.get("generated_at", "—"))}
-      · <a href="/">返回面试主页</a>
+      · <a href="./">返回面试主页</a>
     </div>
   </div>
   {deploy_card}
@@ -775,6 +775,6 @@ DENIED_PAGE = """<!DOCTYPE html>
 <div class="card">
   <h2>需要访问令牌</h2>
   <p class="sub">服务状态页与 API 一样，凭访问令牌进入。</p>
-  <p class="sub">请先从 <a href="/">主页登录</a>（支持带 ?pass= 的链接），再回到 /server。</p>
+  <p class="sub">请先从 <a href="./">主页登录</a>（支持带 ?pass= 的链接），再回到 /server。</p>
 </div>
 </div></body></html>""".replace("{css}", _PAGE_CSS)
