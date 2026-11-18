@@ -61,6 +61,48 @@ button { cursor: pointer; }
 .who { color: var(--muted); font-size: 13px; }
 .who::before { content: "当前用户 · "; color: var(--faint); }
 
+.clean-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 4px 12px 4px 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.clean-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.clean-toggle:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.clean-toggle .switch-track {
+  position: relative;
+  flex: none;
+  width: 30px;
+  height: 17px;
+  border-radius: 999px;
+  background: #d6dfe2;
+  transition: background .18s ease;
+}
+.clean-toggle .switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(15, 35, 40, .25);
+  transition: transform .18s ease;
+}
+.clean-toggle .switch-label { white-space: nowrap; }
+.clean-toggle[aria-checked="true"] { color: var(--accent); border-color: #b9ddd7; background: var(--accent-soft); }
+.clean-toggle[aria-checked="true"] .switch-track { background: var(--accent); }
+.clean-toggle[aria-checked="true"] .switch-knob { transform: translateX(13px); }
+@media (prefers-reduced-motion: reduce) {
+  .clean-toggle .switch-track, .clean-toggle .switch-knob { transition: none; }
+}
+
 .layout { display: flex; gap: 20px; max-width: 1240px; margin: 0 auto; padding: 22px 24px 48px; align-items: flex-start; }
 .sidebar { width: 268px; flex: none; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; position: sticky; top: 22px; }
 .side-title { font-size: 12px; color: var(--faint); letter-spacing: .5px; margin: 20px 0 10px; }
@@ -173,8 +215,9 @@ button { cursor: pointer; }
   .session-list { max-height: 220px; }
 }
 
-
-.interview-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-.interview-heading h2 { margin: 0; }
-.clean-toggle { flex: none; margin-left: auto; white-space: nowrap; }
-.clean-toggle[aria-checked="true"] { color: var(--accent); background: var(--accent-soft); border-color: #b9ddd7; }
+@media (max-width: 720px) {
+  .topbar { padding: 0 14px; gap: 10px; }
+  .topright { gap: 10px; }
+  .clean-toggle { padding: 4px 6px; }
+  .clean-toggle .switch-label { display: none; }
+}

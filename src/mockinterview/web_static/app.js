@@ -1,6 +1,36 @@
 const $ = (selector) => document.querySelector(selector);
 const content = $('#content');
 const sessionList = $('#session-list');
+const cleanToggle = $('#clean-toggle');
+const CLEAN_KEY = 'mockinterview.cleanMode';
+
+// 纯净模式是全局显示偏好，放在头部；选择记在 localStorage 里，
+// 换一场面试、刷新页面都保持上次的状态。
+function readCleanMode() {
+  try {
+    const saved = localStorage.getItem(CLEAN_KEY);
+    return saved === null ? true : saved === '1';
+  } catch (_) {
+    return true;
+  }
+}
+
+function writeCleanMode(value) {
+  try {
+    localStorage.setItem(CLEAN_KEY, value ? '1' : '0');
+  } catch (_) {
+    // 隐私模式等场景写不了，忽略即可，本次会话内依然生效。
+  }
+}
+
+function syncCleanToggle() {
+  if (!cleanToggle) return;
+  const on = Boolean(state.cleanMode);
+  cleanToggle.setAttribute('aria-checked', String(on));
+  cleanToggle.title = on
+    ? '纯净模式：只显示面试官与你的对话'
+    : '纯净模式已关闭：显示系统提示与运行统计';
+}
 
 const state = {
   user: null,
@@ -15,7 +45,7 @@ const state = {
   error: '',
   emptyConfirm: false,
   clearDraft: false,
-  cleanMode: true,
+  cleanMode: readCleanMode(),
   reportHtml: '',
   reportFor: null,
   revision: null,
@@ -323,13 +353,7 @@ function renderDetail(detail) {
     </div>`;
   }
   return `<div class="card">
-      <div class="interview-heading">
-        <h2>面试对话</h2>
-        <button class="ghost clean-toggle" type="button" data-action="toggle-clean"
-          role="switch" aria-checked="${state.cleanMode}" aria-label="纯净模式">
-          纯净模式：${state.cleanMode ? '开启' : '关闭'}
-        </button>
-      </div>
+      <h2>面试对话</h2>
       ${state.cleanMode ? '' : '<p class="card-sub">展示完整系统提示、对话及运行统计。</p>'}
       <div class="meta-grid">${chips}</div>
     </div>
@@ -341,6 +365,7 @@ function renderDetail(detail) {
 function render() {
   const previous = $('#answer-input');
   const draft = previous ? previous.value : null;
+  syncCleanToggle();
   if (state.view === 'new') content.innerHTML = renderNew();
   else if (state.view === 'detail' && state.detail) content.innerHTML = renderDetail(state.detail);
   else content.innerHTML = renderEmpty();
@@ -529,6 +554,15 @@ $('#logout').addEventListener('click', async () => {
   showLogin();
 });
 
+// 旧版 index.html（浏览器缓存里没有这个按钮）也要能用，缺元素就跳过绑定。
+cleanToggle?.addEventListener('click', () => {
+  state.cleanMode = !state.cleanMode;
+  writeCleanMode(state.cleanMode);
+  // 新建表单里的输入没有实时同步到 state，切换前先收一遍，免得被重渲染冲掉。
+  if (state.view === 'new') readForm();
+  render();
+});
+
 $('#new-btn').addEventListener('click', () => {
   state.view = 'new';
   state.current = null;
@@ -549,11 +583,7 @@ content.addEventListener('click', async (event) => {
   if (!button) return;
   const action = button.dataset.action;
   try {
-    if (action === 'toggle-clean') {
-      state.cleanMode = !state.cleanMode;
-      render();
-      content.querySelector('[data-action="toggle-clean"]').focus();
-    } else if (action === 'cancel') {
+    if (action === 'cancel') {
       state.view = 'empty';
       state.error = '';
       render();
@@ -615,6 +645,7 @@ content.addEventListener('click', async (event) => {
 });
 
 (async () => {
+  syncCleanToggle();
   const params = new URLSearchParams(window.location.search);
   const urlPass = params.get('pass');
   const tokenInput = $('#pass-input');

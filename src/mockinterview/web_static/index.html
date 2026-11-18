@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>模拟面试</title>
-  <link rel="stylesheet" href="app.css">
+  <link rel="stylesheet" href="app.css?v=2">
 </head>
 <body>
   <section id="login-view" class="login-wrap">
@@ -29,6 +29,11 @@
       <div class="topright">
         <span class="who" id="pass-status"></span>
         <span class="who" id="who"></span>
+        <button class="clean-toggle" id="clean-toggle" type="button"
+          role="switch" aria-checked="true" aria-label="纯净模式" title="纯净模式：只显示面试官与你的对话">
+          <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
+          <span class="switch-label">纯净模式</span>
+        </button>
         <button class="ghost" id="logout" type="button">退出</button>
       </div>
     </header>
@@ -41,6 +46,6 @@
       <main class="content" id="content"></main>
     </div>
   </div>
-  <script src="app.js"></script>
+  <script src="app.js?v=2"></script>
 </body>
 </html>

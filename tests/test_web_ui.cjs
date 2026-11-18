@@ -4,7 +4,12 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 function app() {
-  const nodes = { '#content': { innerHTML: '' }, '#answer-input': { value: '还没有提交的回答' } };
+  const cleanToggle = { attrs: {}, title: '', setAttribute(name, value) { this.attrs[name] = value; } };
+  const nodes = {
+    '#content': { innerHTML: '' },
+    '#answer-input': { value: '还没有提交的回答' },
+    '#clean-toggle': cleanToggle,
+  };
   const context = vm.createContext({
     document: { querySelector: selector => nodes[selector] || {} },
   });
@@ -24,7 +29,7 @@ const detail = {
 };
 
 test('clean mode defaults on and preserves dialogue, metadata and answer controls', () => {
-  const { run } = app();
+  const { run, nodes } = app();
   const html = run(`renderDetail(${JSON.stringify(detail)})`);
   assert(!html.includes('快评决策'));
   assert(!html.includes('metrics-table'));
@@ -33,11 +38,15 @@ test('clean mode defaults on and preserves dialogue, metadata and answer control
   assert(html.includes('主题<b>并发</b>'));
   assert(html.includes('Token<b>100</b>'));
   assert(html.includes('id="answer-input"'));
-  assert(html.includes('aria-checked="true"'));
+  // 开关已挪到头部，不再由内容区渲染，状态改由 syncCleanToggle 同步到头部的按钮上。
+  assert(!html.includes('clean-toggle'));
+  run('syncCleanToggle()');
+  assert.equal(nodes['#clean-toggle'].attrs['aria-checked'], 'true');
   run('state.cleanMode = false');
   const full = run(`renderDetail(${JSON.stringify(detail)})`);
   assert(full.includes('快评决策'));
-  assert(full.includes('aria-checked="false"'));
+  run('syncCleanToggle()');
+  assert.equal(nodes['#clean-toggle'].attrs['aria-checked'], 'false');
 });
 
 test('clean mode keeps waiting, error and empty answer confirmation states', () => {
