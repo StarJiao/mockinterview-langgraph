@@ -485,13 +485,16 @@ def create_app(service: WebService) -> FastAPI:
 
         The pass cookie alone cannot complete login (the username cookie is
         separate), and the form cannot read an httponly cookie — so the token
-        rides one more hop via ?pass= for the frontend to prefill.
+        rides one more hop via ?pass= for the frontend to prefill. The
+        redirect target is relative on purpose: the app may live at root or
+        under a subpath (/interview/), and a relative Location resolves
+        against whatever URL the visitor used.
         """
         token = token.strip()
         pass_row = await fetch_pass(token, service)
         if not pass_is_valid(pass_row):
-            return RedirectResponse("/?pass_error=1", status_code=302)
-        response = RedirectResponse(f"/?pass={token}", status_code=302)
+            return RedirectResponse("?pass_error=1", status_code=302)
+        response = RedirectResponse(f"?pass={token}", status_code=302)
         response.set_cookie(
             PASS_COOKIE, token, httponly=True, samesite="lax", path="/",
             max_age=pass_max_age(pass_row), secure=service.secure_cookies,

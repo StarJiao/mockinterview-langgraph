@@ -459,10 +459,10 @@ async def test_api_requires_a_valid_pass_and_exchange_route_sets_the_cookie(web)
     async with fresh:
         junk = await fresh.get("/pass/junk-token", follow_redirects=False)
         assert junk.status_code == 302
-        assert junk.headers["location"] == "/?pass_error=1"
+        assert junk.headers["location"] == "?pass_error=1"
         exchanged = await fresh.get(f"/pass/{token}", follow_redirects=False)
         assert exchanged.status_code == 302
-        assert exchanged.headers["location"] == f"/?pass={token}"
+        assert exchanged.headers["location"] == f"?pass={token}"
         # The friend lands on the login form with the token prefilled; entering
         # only a username creates the user on first login.
         assert (await fresh.post("/api/login", json={"username": "carol", "pass_token": token})).status_code == 200

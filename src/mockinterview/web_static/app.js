@@ -52,11 +52,15 @@ function multiline(value) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  // Always fetch relative: the app may be served at root (/) or under a
+  // subpath (/interview/) behind nginx, so absolute /api/... would escape
+  // the prefix. Stripping the leading slash makes both deployments work.
+  const target = path.startsWith('/') ? path.slice(1) : path;
+  const response = await fetch(target, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
-  if (response.status === 401 && !path.startsWith('/api/login')) {
+  if (response.status === 401 && !target.startsWith('api/login')) {
     // Pass expired or revoked mid-session: back to the login gate.
     window.dispatchEvent(new CustomEvent('auth-lost'));
   }
