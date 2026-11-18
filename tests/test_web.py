@@ -638,3 +638,33 @@ async def test_server_page_masks_model_keys_but_shows_models(tmp_path, monkeypat
     assert "sk-s****56" in body
     assert "sk-a****21" in body
     assert "deepseek-chat" in body  # 模型名与 base_url 不脱敏，便于核对生效配置
+
+
+async def test_server_page_replaces_call_details_with_hourly_charts(web):
+    """No working-dir/cmdline rows; the call-detail table becomes two charts."""
+    client, service, _ = web
+    base = {
+        "stage_key": "plan",
+        "label": "生成考点计划",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "duration_ms": 1200,
+        "tokens": 5432,
+        "ok": True,
+        "error": "",
+        "attempts": 1,
+    }
+    await service.store.add_stage_metric("s-ok", base)
+    await service.store.add_stage_metric("s-fail", {**base, "tokens": 10, "ok": False, "error": "TimeoutError"})
+
+    token, _ = await make_pass(service)
+    await client.post("/api/login", json={"username": "alice", "pass_token": token})
+    body = (await client.get("/server")).text
+
+    assert "工作目录" not in body
+    assert "启动命令" not in body
+    assert "最近模型调用" not in body
+    assert "生成考点计划" not in body  # 逐条明细已被聚合看板替换
+    assert "Token 消耗" in body
+    assert "API 错误（区分类型）" in body
+    assert "TimeoutError" in body      # 错误类型图例与汇总表可见

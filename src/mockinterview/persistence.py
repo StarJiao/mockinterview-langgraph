@@ -495,26 +495,15 @@ class OperationStore:
             "passes_unused": row[9],
         }
 
-    async def recent_metrics(self, limit: int = 20) -> list[dict]:
-        """Newest model calls across all sessions, for the status page."""
+    async def metrics_window(self, since: str) -> list[dict]:
+        """Model calls since a cutoff (ISO string compare, same stored format)."""
         async with self.conn.execute(
-            "SELECT session_id, stage_key, label, started_at, duration_ms, "
-            "tokens, ok, error, attempts FROM stage_metrics "
-            "ORDER BY id DESC LIMIT ?",
-            (limit,),
+            "SELECT started_at, tokens, ok, error FROM stage_metrics "
+            "WHERE started_at >= ? ORDER BY started_at",
+            (since,),
         ) as cur:
             rows = await cur.fetchall()
         return [
-            {
-                "session_id": row[0],
-                "key": row[1],
-                "label": row[2],
-                "started_at": row[3],
-                "duration_ms": row[4],
-                "tokens": row[5],
-                "ok": bool(row[6]),
-                "error": row[7],
-                "attempts": row[8],
-            }
+            {"started_at": row[0], "tokens": row[1], "ok": bool(row[2]), "error": row[3]}
             for row in rows
         ]

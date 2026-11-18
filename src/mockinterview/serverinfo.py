@@ -11,7 +11,7 @@ it directly because the gate middleware only guards /api/*.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import html
 import os
 from pathlib import Path
@@ -27,6 +27,11 @@ from .config import Config
 
 REFRESH_SECONDS = 30
 LOG_LINES = 20
+ACTIVITY_HOURS = 48
+"""Hourly buckets for the status-page charts; Beijing time (UTC+8) labels."""
+
+BJ_TZ = timezone(timedelta(hours=8))
+CHART_COLORS = ["#0f766e", "#b42318", "#a16207", "#2b5f9e", "#7c3aed", "#db2777"]
 
 MASKED_KEY = "****"
 
@@ -124,6 +129,55 @@ def _recent_logs() -> dict:
                     f"sudo journalctl -u mockinterview -n {LOG_LINES}",
         }
     return {"lines": result.stdout.strip().splitlines()[-LOG_LINES:], "note": ""}
+
+
+def _activity_view(rows: list[dict], hours: int = ACTIVITY_HOURS) -> dict:
+    """Aggregate model calls into hourly Beijing-time buckets.
+
+    Rows come from store.metrics_window(). Buckets include empty hours so the
+    time axis stays honest; aggregation happens in Python because the stored
+    ISO timestamps carry microseconds that SQLite date functions may reject.
+    """
+    now = datetime.now(BJ_TZ)
+    start = (now - timedelta(hours=hours - 1)).replace(minute=0, second=0, microsecond=0)
+    buckets = [start + timedelta(hours=i) for i in range(hours)]
+    index = {bucket: i for i, bucket in enumerate(buckets)}
+    tokens = [0] * hours
+    errors: dict[str, list[int]] = {}
+    last_error: dict[str, str] = {}
+    for row in rows:
+        try:
+            at = datetime.fromisoformat(row["started_at"]).astimezone(BJ_TZ)
+        except (ValueError, TypeError):
+            continue
+        position = index.get(at.replace(minute=0, second=0, microsecond=0))
+        if position is None:
+            continue
+        tokens[position] += int(row.get("tokens") or 0)
+        if not row.get("ok"):
+            error_type = row.get("error") or "UnknownError"
+            counts = errors.setdefault(error_type, [0] * hours)
+            counts[position] += 1
+            last_error[error_type] = row["started_at"]
+    ranked = sorted(
+        errors.items(), key=lambda item: sum(item[1]), reverse=True
+    )
+    return {
+        "hours": hours,
+        "labels": [bucket.strftime("%m-%d %H时") for bucket in buckets],
+        "tokens": tokens,
+        "total_tokens": sum(tokens),
+        "total_errors": sum(sum(counts) for counts in errors.values()),
+        "error_types": [
+            {
+                "type": error_type,
+                "counts": counts,
+                "total": sum(counts),
+                "last_seen": last_error.get(error_type, ""),
+            }
+            for error_type, counts in ranked
+        ],
+    }
 
 
 def _config_view(env_path: str | None) -> dict:
@@ -269,7 +323,8 @@ async def collect_server_info(service) -> dict:
     for row in passes:
         row.pop("token", None)
         row.pop("token_hash", None)
-    recent = await service.store.recent_metrics(LOG_LINES)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=ACTIVITY_HOURS)).isoformat()
+    window = await service.store.metrics_window(cutoff)
     return {
         "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "demo": bool(service.options_base.get("demo", False)),
@@ -280,7 +335,7 @@ async def collect_server_info(service) -> dict:
         "logs": _recent_logs(),
         "stats": stats,
         "passes": passes,
-        "recent_metrics": recent,
+        "activity": _activity_view(window),
         **system,
     }
 
@@ -329,6 +384,14 @@ border-radius:8px;padding:9px 12px;font-size:12.5px;margin-top:8px}
 .sub{color:var(--muted);font-size:12.5px;margin:0 0 4px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
 .grid .card{margin-bottom:0}
+.chart{border-bottom:1px solid var(--line)}
+.cols{display:flex;align-items:stretch;height:140px;margin-top:6px}
+.col{flex:1;display:flex;flex-direction:column;min-width:0;cursor:default}
+.colbars{flex:1;display:flex;flex-direction:column;justify-content:flex-end}
+.colbars i{display:block}
+.lbl{height:15px;font-size:9px;color:var(--faint);text-align:center;white-space:nowrap;overflow:hidden}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:10px 0 2px}
+.dot{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:-1px}
 h1{font-size:0;margin:0}
 @media(max-width:680px){.grid{grid-template-columns:1fr}}
 """
@@ -398,6 +461,36 @@ def _format_ts(iso: str | None) -> str:
     return iso[:19].replace("T", " ")
 
 
+def _stacked_chart(
+    series: list[list[int]],
+    labels: list[str],
+    colors: list[str],
+    titles: list[str] | None = None,
+    label_every: int = 6,
+) -> str:
+    """Server-side stacked bar chart: pure CSS, one column per hourly bucket."""
+    if not labels:
+        return '<p class="faint" style="font-size:13px">暂无数据</p>'
+    totals = [sum(values[i] for values in series) for i in range(len(labels))]
+    max_total = max(totals) or 1
+    columns = []
+    for i, label in enumerate(labels):
+        segments = "".join(
+            f'<i style="height:{values[i] / max_total * 100:.2f}%;'
+            f'background:{colors[si % len(colors)]}"></i>'
+            for si, values in enumerate(series)
+            if values[i]
+        )
+        text = titles[i] if titles and i < len(titles) else label
+        shown = label if i % label_every == 0 else ""
+        columns.append(
+            f'<div class="col" title="{esc(text)}">'
+            f'<div class="colbars">{segments}</div>'
+            f'<span class="lbl">{esc(shown)}</span></div>'
+        )
+    return f'<div class="chart"><div class="cols">{"".join(columns)}</div></div>'
+
+
 def render_server_page(info: dict) -> str:
     errors = info.get("errors") or []
     error_html = ""
@@ -445,8 +538,6 @@ def render_server_page(info: dict) -> str:
         ["线程数", str(process.get("threads", "—"))],
         ["打开文件数", "—" if process.get("fds") is None else str(process["fds"])],
         ["网络连接数", "—" if process.get("connections") is None else str(process["connections"])],
-        ["工作目录", esc(process.get("cwd", "—"))],
-        ["启动命令", esc(process.get("cmdline", "—"))],
     ]
     deploy_card = _card(
         "部署与运行",
@@ -557,21 +648,6 @@ def render_server_page(info: dict) -> str:
         ]
         for row in info.get("passes", [])
     ]
-    metric_rows = [
-        [
-            esc(row["started_at"][:19].replace("T", " ")),
-            f'<code>{esc(row["session_id"][-14:])}</code>',
-            esc(row["label"]),
-            f'{row["duration_ms"]:,} ms',
-            f'<span class="num">{row["tokens"]:,}</span>',
-            (
-                '<span class="ok">成功</span>'
-                if row["ok"]
-                else f'<span class="fail">失败 · {esc(row["error"])}</span>'
-            ),
-        ]
-        for row in info.get("recent_metrics", [])
-    ]
     data_card = _card(
         "业务数据",
         _chips(stat_pairs)
@@ -579,11 +655,72 @@ def render_server_page(info: dict) -> str:
         + _table(
             ["ID", "类型", "备注", "#配额 / 已用", "首次使用", "有效期至", "状态"],
             pass_rows,
-        )
-        + '<h2 style="margin-top:16px">最近模型调用</h2>'
-        + _table(["时间", "会话", "环节", "#耗时", "#token", "结果"], metric_rows),
+        ),
         sub="令牌本体与哈希一律不在此页显示；会话只显示末 14 位",
     )
+
+    # --- 按小时的 token / 错误看板 ---
+    activity = info.get("activity") or {}
+    labels = activity.get("labels", [])
+    hours = activity.get("hours", ACTIVITY_HOURS)
+    window_note = f"北京时间 · 最近 {hours} 小时 · 悬停可见每小时明细"
+
+    token_values = activity.get("tokens", [])
+    token_titles = [
+        f"{label} · {token_values[i]:,} token" if i < len(token_values) else label
+        for i, label in enumerate(labels)
+    ]
+    token_card = _card(
+        "Token 消耗",
+        _stacked_chart([token_values], labels, [CHART_COLORS[0]], titles=token_titles)
+        + _chips(
+            [
+                ("窗口内合计", f"{activity.get('total_tokens', 0):,} token", ""),
+                ("窗口内调用错误", f"{activity.get('total_errors', 0)} 次", ""),
+            ]
+        ),
+        sub=window_note,
+    )
+
+    error_types = activity.get("error_types", [])
+    if error_types:
+        error_series = [entry["counts"] for entry in error_types]
+        error_titles = [
+            " · ".join(
+                f"{entry['type']} {entry['counts'][i]} 次"
+                for entry in error_types
+                if entry["counts"][i]
+            ) or f"{label} · 无错误"
+            for i, label in enumerate(labels)
+        ]
+        legend = "".join(
+            f'<span class="dot" style="background:{CHART_COLORS[i % len(CHART_COLORS)]}"></span>'
+            f'{esc(entry["type"])}（{entry["total"]} 次）'
+            for i, entry in enumerate(error_types)
+        )
+        error_inner = (
+            _stacked_chart(
+                error_series,
+                labels,
+                [CHART_COLORS[i % len(CHART_COLORS)] for i in range(len(error_types))],
+                titles=error_titles,
+            )
+            + f'<div class="legend">{legend}</div>'
+            + _table(
+                ["错误类型", "#合计", "最近一次"],
+                [
+                    [
+                        f'<span class="fail">{esc(entry["type"])}</span>',
+                        f'<span class="num">{entry["total"]}</span>',
+                        esc(_format_ts(entry["last_seen"])),
+                    ]
+                    for entry in error_types
+                ],
+            )
+        )
+    else:
+        error_inner = '<p class="faint" style="font-size:13px">窗口内没有 API 错误</p>'
+    error_card = _card("API 错误（区分类型）", error_inner, sub=window_note)
 
     # --- 日志 ---
     logs = info.get("logs") or {}
@@ -619,6 +756,10 @@ def render_server_page(info: dict) -> str:
     {sys_card}
   </div>
   {data_card}
+  <div class="grid">
+    {token_card}
+    {error_card}
+  </div>
   {log_card}
   {error_html}
 </div>
