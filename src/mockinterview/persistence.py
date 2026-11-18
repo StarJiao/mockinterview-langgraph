@@ -463,3 +463,58 @@ class OperationStore:
         ) as cur:
             (total,) = await cur.fetchone()
         return int(total)
+
+    async def global_stats(self) -> dict:
+        """Counts for the read-only status page; no secrets, no payloads."""
+        now = datetime.now(timezone.utc).isoformat()
+        async with self.conn.execute("""
+            SELECT
+                (SELECT COUNT(*) FROM sessions),
+                (SELECT COUNT(*) FROM users),
+                (SELECT COUNT(*) FROM session_events),
+                (SELECT COUNT(*) FROM stage_metrics),
+                (SELECT COALESCE(SUM(tokens), 0) FROM stage_metrics),
+                (SELECT COUNT(*) FROM stage_metrics WHERE ok = 0),
+                (SELECT COUNT(*) FROM passes),
+                (SELECT COUNT(*) FROM passes WHERE revoked = 1),
+                (SELECT COUNT(*) FROM passes WHERE revoked = 0 AND expires_at > ?),
+                (SELECT COUNT(*) FROM passes WHERE revoked = 0 AND expires_at > ?
+                    AND first_used_at IS NULL)
+        """, (now, now)) as cur:
+            row = await cur.fetchone()
+        return {
+            "sessions": row[0],
+            "users": row[1],
+            "events": row[2],
+            "metric_calls": row[3],
+            "total_tokens": row[4],
+            "metric_failures": row[5],
+            "passes_total": row[6],
+            "passes_revoked": row[7],
+            "passes_active": row[8],
+            "passes_unused": row[9],
+        }
+
+    async def recent_metrics(self, limit: int = 20) -> list[dict]:
+        """Newest model calls across all sessions, for the status page."""
+        async with self.conn.execute(
+            "SELECT session_id, stage_key, label, started_at, duration_ms, "
+            "tokens, ok, error, attempts FROM stage_metrics "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            {
+                "session_id": row[0],
+                "key": row[1],
+                "label": row[2],
+                "started_at": row[3],
+                "duration_ms": row[4],
+                "tokens": row[5],
+                "ok": bool(row[6]),
+                "error": row[7],
+                "attempts": row[8],
+            }
+            for row in rows
+        ]

@@ -590,3 +590,51 @@ async def test_temp_pass_clock_starts_on_first_use_not_at_issue_time(web):
     long_expires_before = issued["expires_at"]
     await login(client, "owner", token=long_token)
     assert (await service.store.list_passes())[-1]["expires_at"] == long_expires_before
+
+
+async def test_server_page_needs_the_pass_cookie_and_never_leaks_tokens(web):
+    """The status page re-validates the pass itself; tokens stay out of HTML."""
+    client, service, _ = web
+    denied = await client.get("/server")
+    assert denied.status_code == 401
+    assert "需要访问令牌" in denied.text
+
+    token, _ = await make_pass(service)
+    await client.post("/api/login", json={"username": "alice", "pass_token": token})
+    page = await client.get("/server")
+    assert page.status_code == 200
+    assert "服务状态" in page.text
+    assert "访问令牌" in page.text
+    # The issued token exists in token_plain; the page must not carry it.
+    assert token not in page.text
+
+
+async def test_server_page_masks_model_keys_but_shows_models(tmp_path, monkeypatch):
+    # Config.load gives shell env vars precedence over the env file; clear the
+    # host's own keys so the page reflects the test's env file.
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "DEEPSEEK_API_KEY=sk-secret-deepseek-key-123456\n"
+        "DASHSCOPE_API_KEY=sk-alias-dashscope-key-654321\n"
+    )
+    service = WebService(
+        DemoBackend(), tmp_path / "data", OPTIONS_BASE,
+        notify=lambda _: None, env_path=str(env_file),
+    )
+    application = create_app(service)
+    async with application.router.lifespan_context(application):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="http://test"
+        ) as client:
+            token, _ = await make_pass(service)
+            await client.post("/api/login", json={"username": "alice", "pass_token": token})
+            page = await client.get("/server")
+    assert page.status_code == 200
+    body = page.text
+    assert "sk-secret-deepseek-key-123456" not in body
+    assert "sk-alias-dashscope-key-654321" not in body
+    assert "sk-s****56" in body
+    assert "sk-a****21" in body
+    assert "deepseek-chat" in body  # 模型名与 base_url 不脱敏，便于核对生效配置

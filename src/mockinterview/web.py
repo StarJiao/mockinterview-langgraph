@@ -25,11 +25,12 @@ from urllib.parse import quote, unquote
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .report import render_report
 from .runtime import InterviewApp
+from .serverinfo import DENIED_PAGE, collect_server_info, render_server_page
 from .state import round_label
 from .telemetry import StageTracker
 
@@ -189,13 +190,23 @@ def pending_anchor(turn) -> str:
 class WebService:
     """One process-wide InterviewApp; per-session asyncio locks serialize turns."""
 
-    def __init__(self, backend, data_dir, options_base: dict, notify=None):
+    def __init__(
+        self,
+        backend,
+        data_dir,
+        options_base: dict,
+        notify=None,
+        env_path: str | None = None,
+    ):
         self.backend = backend
         self.data_dir = Path(data_dir)
         self.options_base = dict(options_base)
         # Cookies must carry Secure once the site is served over HTTPS;
         # the CLI flips this via --secure-cookie (no-op on plain HTTP).
         self.secure_cookies = bool(self.options_base.get("secure_cookies", False))
+        # Kept as a path only: the status page re-reads the env file per
+        # request so model switches show up there; keys never rest in memory.
+        self.env_path = env_path
         self.notify = notify or (lambda text: print(f"[系统] {str(text).replace(chr(27), '')}"))
         self.tasks: dict[str, asyncio.Task] = {}
         self.locks: dict[str, asyncio.Lock] = {}
@@ -420,6 +431,16 @@ def create_app(service: WebService) -> FastAPI:
     @app.get("/app.js")
     async def script():
         return FileResponse(STATIC_DIR / "app.js", media_type="application/javascript")
+
+    @app.get("/server")
+    async def server_page(request: Request, service: WebService = Depends(service_of)):
+        """Read-only status page. The gate middleware only covers /api/*, so
+        this handler re-validates the pass cookie itself and renders 401 HTML."""
+        pass_row = await fetch_pass(request.cookies.get(PASS_COOKIE), service)
+        if not pass_is_valid(pass_row):
+            return HTMLResponse(DENIED_PAGE, status_code=401)
+        info = await collect_server_info(service)
+        return HTMLResponse(render_server_page(info))
 
     @app.get("/api/topics")
     async def topics():
@@ -681,10 +702,18 @@ def create_app(service: WebService) -> FastAPI:
     return app
 
 
-async def serve(backend, data_dir, options_base: dict, host: str, port: int, notify=None):
+async def serve(
+    backend,
+    data_dir,
+    options_base: dict,
+    host: str,
+    port: int,
+    notify=None,
+    env_path: str | None = None,
+):
     import uvicorn
 
-    service = WebService(backend, Path(data_dir), options_base, notify=notify)
+    service = WebService(backend, Path(data_dir), options_base, notify=notify, env_path=env_path)
     application = create_app(service)
     server = uvicorn.Server(
         uvicorn.Config(application, host=host, port=port, log_level="info")

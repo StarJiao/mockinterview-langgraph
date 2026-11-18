@@ -1,0 +1,4 @@
+interface:
+  display_name: "技术模拟面试"
+  short_description: "规划考点、动态追问、证据化四维评分与复盘，支持原项目完整运行流程"
+  default_prompt: "使用 $mock-interview 根据我的目标岗位开展一场三题技术模拟面试，逐题提问，最后给出有回答原文依据的评分和复习建议。"

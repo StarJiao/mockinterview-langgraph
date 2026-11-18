@@ -378,7 +378,8 @@ async def run(args) -> int:
             "所有 API 凭访问令牌进入（pass new 签发），用户名只用于区分数据。"
         )
         await serve(
-            backend, Path(args.data_dir), options_base, args.host, args.port, notify=console.system
+            backend, Path(args.data_dir), options_base, args.host, args.port,
+            notify=console.system, env_path=args.env,
         )
         return 0
     read_only = args.command in {"sessions", "report"}
