@@ -389,7 +389,7 @@ border-radius:8px;padding:9px 12px;font-size:12.5px;margin-top:8px}
 .col{flex:1;display:flex;flex-direction:column;min-width:0;cursor:default}
 .colbars{flex:1;display:flex;flex-direction:column;justify-content:flex-end}
 .colbars i{display:block}
-.lbl{height:15px;font-size:9px;color:var(--faint);text-align:center;white-space:nowrap;overflow:hidden}
+.lbl{height:15px;font-size:9px;color:var(--faint);text-align:center;white-space:nowrap;overflow:visible}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:10px 0 2px}
 .dot{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:-1px}
 h1{font-size:0;margin:0}
@@ -437,11 +437,14 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 def _pass_state(row: dict) -> str:
     if row["revoked"]:
         return '<span class="fail">已作废</span>'
+    # An unused temp pass's pre-set expires_at is a placeholder, not a deadline:
+    # first use re-anchors it (first_used_at + ttl). Only activation makes the
+    # clock real, so unused passes never count as expired here.
+    if row["kind"] == "temp" and row["first_used_at"] is None:
+        return '<span class="faint">未激活（首用起计时）</span>'
     now = datetime.now(timezone.utc).isoformat()
     if row["expires_at"] <= now:
         return '<span class="fail">已过期</span>'
-    if row["kind"] == "temp" and row["first_used_at"] is None:
-        return '<span class="faint">未激活（首用起计时）</span>'
     return '<span class="ok">有效</span>'
 
 
@@ -466,7 +469,7 @@ def _stacked_chart(
     labels: list[str],
     colors: list[str],
     titles: list[str] | None = None,
-    label_every: int = 6,
+    label_every: int = 8,
 ) -> str:
     """Server-side stacked bar chart: pure CSS, one column per hourly bucket."""
     if not labels:
@@ -673,16 +676,17 @@ def render_server_page(info: dict) -> str:
     token_card = _card(
         "Token 消耗",
         _stacked_chart([token_values], labels, [CHART_COLORS[0]], titles=token_titles)
-        + _chips(
-            [
-                ("窗口内合计", f"{activity.get('total_tokens', 0):,} token", ""),
-                ("窗口内调用错误", f"{activity.get('total_errors', 0)} 次", ""),
-            ]
-        ),
+        + _chips([("窗口内合计", f"{activity.get('total_tokens', 0):,} token", "")]),
         sub=window_note,
     )
 
     error_types = activity.get("error_types", [])
+    error_chips = _chips(
+        [
+            ("窗口内错误合计", f"{activity.get('total_errors', 0)} 次", ""),
+            ("错误类型数", f"{len(error_types)}", ""),
+        ]
+    )
     if error_types:
         error_series = [entry["counts"] for entry in error_types]
         error_titles = [
@@ -719,7 +723,9 @@ def render_server_page(info: dict) -> str:
             )
         )
     else:
-        error_inner = '<p class="faint" style="font-size:13px">窗口内没有 API 错误</p>'
+        error_inner = error_chips + '<p class="faint" style="font-size:13px">窗口内没有 API 错误</p>'
+    if error_types:
+        error_inner = error_chips + error_inner
     error_card = _card("API 错误（区分类型）", error_inner, sub=window_note)
 
     # --- 日志 ---
