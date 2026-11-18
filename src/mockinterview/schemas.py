@@ -74,5 +74,13 @@ class Dimension(BaseModel):
         return self
 
 
+class QuestionFeedback(BaseModel):
+    intent: str = Field(min_length=1)
+    answer_summary: str = Field(min_length=1)
+    overall_review: str = Field(min_length=1)
+    next_step: str = Field(min_length=1)
+
+
 class EvaluationOutput(BaseModel):
     dimensions: list[Dimension]
+    feedback: QuestionFeedback | None = None

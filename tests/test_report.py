@@ -114,3 +114,29 @@ def test_summary_still_reports_missing_scores_before_detail():
     text = render_report(make_state({"s-q1": {"score": "12/20", "judge_text": ""}}))
     assert "尚有 1 题未评分" in text
     assert text.index("尚有 1 题未评分") < text.index("## 逐题记录与评分")
+
+
+def test_question_feedback_precedes_collapsed_records_and_scores():
+    feedback = {
+        "intent": "解释缓存过期与并发回源的关系。",
+        "answer_summary": "你先提出错开过期时间，追问中补充了请求合并。",
+        "overall_review": "方向正确，但请求合并的作用范围还没有展开。",
+        "next_step": "下次补充多实例场景下如何限制回源。",
+    }
+    text = render_report(make_state({"s-q1": {
+        "feedback": feedback,
+        "dimensions": [dimension("技术准确性", 4)],
+        "score": None,
+    }}))
+    assert text.index(feedback["overall_review"]) < text.index("<details>")
+    assert "<details open" not in text
+    assert "<summary>查看评分细则与依据</summary>" in text
+    assert text.count("<details>") == text.count("</details>")
+    assert text.index("技术准确性：4/5") > text.index("查看评分细则与依据")
+    assert "候选人原文：回答" in text
+
+
+def test_legacy_evaluation_is_kept_without_inventing_feedback():
+    text = render_report(make_state({"s-q1": {"score": "12/20", "judge_text": "旧评价"}}))
+    assert "本题尚无整体评价" in text
+    assert "旧评价" in text

@@ -93,6 +93,10 @@ function mdToHtml(markdown) {
       continue;
     }
     if (inCode) { code.push(line); continue; }
+    // Allow only disclosure tags; arbitrary HTML remains escaped.
+    if (line === '<details>' || line === '</details>') { out.push(line); continue; }
+    const summary = line.match(/^<summary>([^<>]*)<\/summary>$/);
+    if (summary) { out.push(`<summary>${escapeHtml(summary[1])}</summary>`); continue; }
     if (!line.trim()) { out.push('<div class="md-gap"></div>'); continue; }
     let text = escapeHtml(line)
       .replace(/`([^`]+)`/g, '<code>$1</code>')

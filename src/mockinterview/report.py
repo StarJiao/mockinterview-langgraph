@@ -169,6 +169,20 @@ def render_report(state: dict) -> str:
                 "",
             ]
         )
+        lines.extend(["**原题**", "", _paragraph(question.get("text", "")), ""])
+        evaluation = evaluations.get(question["id"])
+        feedback = evaluation.get("feedback") if isinstance(evaluation, dict) else None
+        if isinstance(feedback, dict):
+            for key, label in [
+                ("intent", "这题在考什么"),
+                ("answer_summary", "你的回答整理"),
+                ("overall_review", "整体评价"),
+                ("next_step", "下次优先补什么"),
+            ]:
+                lines.extend([f"**{label}**", "", _paragraph(feedback.get(key, "")), ""])
+        elif evaluation:
+            lines.extend(["本题尚无整体评价，可展开查看已保存的评分细则。", ""])
+        lines.extend(["<details>", "<summary>查看完整问答与追问记录</summary>", ""])
         for point in question.get("reference_points", []):
             lines.append(f"> 考点：{_paragraph(point)}")
         lines.append("")
@@ -197,6 +211,7 @@ def render_report(state: dict) -> str:
                 )
         if question.get("closing"):
             lines.extend(["**面试官 · 收尾**", "", _paragraph(question["closing"]), ""])
+        lines.extend(["</details>", ""])
         evaluation = evaluations.get(question["id"])
         if not evaluation:
             error = failures.get(question["id"])
@@ -212,7 +227,12 @@ def render_report(state: dict) -> str:
                 "",
             ]
         )
-        detail = evaluation.get("judge_text", "")
+        lines.extend(["<details>", "<summary>查看评分细则与依据</summary>", ""])
+        detail = (
+            {"dimensions": evaluation["dimensions"]}
+            if evaluation.get("dimensions")
+            else evaluation.get("judge_text", "")
+        )
         # The model boundary may return serialized structured judge feedback, as the Go version did.
         if isinstance(detail, str):
             try:
@@ -260,4 +280,5 @@ def render_report(state: dict) -> str:
                 lines.extend(["```json", json.dumps(detail, ensure_ascii=False, indent=2), "```"])
         else:
             lines.append(_paragraph(detail))
+        lines.extend(["", "</details>", ""])
     return "\n".join(lines)

@@ -413,6 +413,7 @@ class ModelBackend:
                 "judge_model": self.judge_model,
                 "judge_text": json.dumps({"dimensions": dimensions}, ensure_ascii=False, indent=2),
                 "dimensions": dimensions,
+                "feedback": result.data.get("feedback"),
             },
             result.tokens,
         )

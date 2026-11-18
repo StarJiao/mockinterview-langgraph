@@ -422,3 +422,15 @@ async def test_offline_demo_has_exact_plan_and_honest_fake_scores():
     evaluation = (await demo.evaluate(main.data)).data
     assert "非真实评测" in evaluation["judge_model"]
     assert "不代表" in evaluation["judge_text"]
+
+
+async def test_evaluation_persists_question_feedback():
+    feedback = {
+        "intent": "考察机制理解",
+        "answer_summary": "用户实际回答",
+        "overall_review": "结合题意评价",
+        "next_step": "补充一项关键条件",
+    }
+    model = backend(evaluator=[{"dimensions": dimensions(), "feedback": feedback}])
+    result = await model.evaluate(question())
+    assert result.data["feedback"] == feedback
