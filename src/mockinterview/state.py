@@ -32,10 +32,10 @@ def count_rounds(question: dict, kind: str) -> int:
     return sum(round_kind(question, i) == kind for i in range(len(question.get("rounds", []))))
 
 
-def round_label(question: dict, index: int, *, with_limit: bool = False) -> str:
+def round_label(question: dict, index: int, *, with_limit: bool = False, qno: int | None = None) -> str:
     kind = round_kind(question, index)
     if kind == "main":
-        return "主问"
+        return f"主问{qno}" if qno else "主问"
     if kind == "clarification":
         return "题意澄清"
     hop = sum(round_kind(question, i) == "probe" for i in range(index + 1))

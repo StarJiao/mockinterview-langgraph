@@ -157,6 +157,50 @@ button { cursor: pointer; }
 .msg.system .msg-role { color: var(--system); }
 .msg.system .msg-body { font-size: 12.5px; color: #6c5730; }
 
+.q-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0 2px; }
+.q-divider::before, .q-divider::after { content: ""; flex: 1; height: 1px; background: var(--line-strong); }
+.q-divider span { font-size: 12px; font-weight: 500; color: var(--muted); white-space: nowrap; }
+
+/* 新消息从信息流尾部向上推入：透明度 + 位移的组合过渡。 */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+.msg.enter, .q-divider.enter { animation: msg-in .8s cubic-bezier(.22, .61, .36, 1) both; }
+
+/* 打字机光标：流式输出期间挂在消息正文末尾。 */
+.msg-body.typing::after {
+  content: "▍";
+  margin-left: 1px;
+  color: var(--interviewer);
+  animation: caret-blink 1s steps(1) infinite;
+}
+@keyframes caret-blink { 50% { opacity: 0; } }
+
+/* 面试官出题加载块：三个上浮的圆点 + 文字提示。 */
+.dots { display: inline-flex; gap: 4px; align-items: center; margin-right: 8px; }
+.dots i {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--interviewer); opacity: .3;
+  animation: dots-pulse 1.2s ease-in-out infinite;
+}
+.dots i:nth-child(2) { animation-delay: .18s; }
+.dots i:nth-child(3) { animation-delay: .36s; }
+@keyframes dots-pulse {
+  0%, 100% { opacity: .25; transform: translateY(0); }
+  40% { opacity: .9; transform: translateY(-3px); }
+}
+.loading-hint { color: var(--faint); font-size: 12.5px; }
+
+/* 提交后的等待态：只有提交按钮不可点击，编辑框保持可交互。 */
+.answer-box.locked textarea { border-color: var(--line-strong); }
+
+@media (prefers-reduced-motion: reduce) {
+  .msg.enter, .q-divider.enter { animation: none; }
+  .msg-body.typing::after { animation: none; }
+  .dots i { animation: none; opacity: .5; }
+}
+
 .notice { border-radius: 8px; padding: 10px 13px; font-size: 13px; margin-bottom: 14px; }
 .notice.info { background: var(--accent-soft); color: #0c5b54; }
 .notice.warn { background: var(--system-soft); color: #7a5209; }
@@ -166,8 +210,6 @@ button { cursor: pointer; }
 .answer-box textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 .answer-actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
 .answer-hint { color: var(--faint); font-size: 12px; }
-.answer-label { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
-.answer-label b { color: var(--interviewer); font-weight: 500; }
 
 .report { font-size: 13.5px; }
 .report h1 { font-size: 19px; margin: 0 0 14px; }

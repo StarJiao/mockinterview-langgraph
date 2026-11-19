@@ -40,7 +40,6 @@ const state = {
   current: null,
   view: 'empty',
   detail: null,
-  timer: null,
   topicsLoaded: false,
   error: '',
   emptyConfirm: false,
@@ -49,9 +48,22 @@ const state = {
   reportHtml: '',
   reportFor: null,
   revision: null,
-  lastBusy: false,
   stage: null,
   form: { select: '', custom: '', num: '', resume: '', jds: [] },
+  // 增量信息流：streamRendered 是已上屏的服务端消息副本，用于前缀 diff。
+  streamRendered: [],
+  streamSession: null,
+  // 提交回答后的乐观节点：候选人回复 + 面试官加载块，服务端数据到达后被取代。
+  optimistic: { candidate: null, interviewer: null },
+  // 真流式面试官块：qstream 事件驱动的增量上屏，随最终消息定稿或替换。
+  qstream: null,
+  // 定稿之后到达的迟到 delta 要丢弃；新一轮提交/恢复时复位。
+  qstreamSettled: false,
+  // 题目分隔线在出题 token 之前上屏；最终权威消息到达后换成定稿节点。
+  openDivider: null,
+  submitting: false,
+  bottomSig: '',
+  es: null,
 };
 
 function stageText() {
@@ -286,16 +298,318 @@ function renderNew() {
   </div>`;
 }
 
-function renderMessage(message) {
-  const role = ['system', 'interviewer', 'candidate'].includes(message.role) ? message.role : 'system';
-  return `<div class="msg ${role}">
-    <div class="msg-role">${escapeHtml(message.label)}</div>
-    <div class="msg-body">${multiline(message.text)}</div>
-  </div>`;
+// ---------- 信息流：DOM 节点构建、增量同步、打字机 ----------
+
+function sameMsg(a, b) {
+  return a && b && a.role === b.role && a.label === b.label
+    && a.text === b.text && a.anchor === b.anchor;
 }
 
-function renderDetail(detail) {
-  const session = detail.session || {};
+function msgNode(message, animate) {
+  const anchor = typeof message.anchor === 'string' ? message.anchor : '';
+  const el = document.createElement('div');
+  if (anchor.endsWith(':open')) {
+    el.className = 'q-divider' + (animate ? ' enter' : '');
+    el.innerHTML = `<span>${escapeHtml(message.text || '')}</span>`;
+    return el;
+  }
+  const role = ['system', 'interviewer', 'candidate'].includes(message.role)
+    ? message.role : 'system';
+  if (state.cleanMode && role === 'system') return null;
+  el.className = `msg ${role}` + (animate ? ' enter' : '');
+  el.dataset.text = message.text || '';
+  el.innerHTML = `<div class="msg-role">${escapeHtml(message.label)}</div>
+    <div class="msg-body">${multiline(message.text)}</div>`;
+  return el;
+}
+
+function removeOptimisticNodes() {
+  if (state.optimistic.candidate) {
+    state.optimistic.candidate.node.remove();
+    state.optimistic.candidate = null;
+  }
+  if (state.optimistic.interviewer) {
+    state.optimistic.interviewer.node.remove();
+    state.optimistic.interviewer = null;
+  }
+  if (state.qstream) {
+    state.qstream.node.remove();
+    state.qstream = null;
+  }
+  if (state.openDivider) {
+    state.openDivider.node.remove();
+    state.openDivider = null;
+  }
+}
+
+function loadingBodyHtml() {
+  return `<span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span class="loading-hint">面试官正在出题…</span>`;
+}
+
+// 打字机：冒号前的「主问N：」前缀立即上屏，问题正文逐字流出。
+// 流速按文本长度自适应，总时长钳制在 1.2–5s，避免长题面等太久。
+function startTyping(node) {
+  const body = node.querySelector('.msg-body');
+  const text = node.dataset.text || '';
+  if (!body || !text) return;
+  const cut = text.indexOf('：');
+  const prefix = cut >= 0 ? text.slice(0, cut + 1) : '';
+  const rest = cut >= 0 ? text.slice(cut + 1) : text;
+  if (!rest) { body.innerHTML = multiline(text); return; }
+  body.classList.add('typing');
+  body.innerHTML = `${multiline(prefix)}<span class="type-text"></span>`;
+  const target = body.querySelector('.type-text');
+  const tickMs = 24;
+  const totalMs = Math.min(5000, Math.max(1200, rest.length * 28));
+  const per = Math.max(1, Math.ceil(rest.length / (totalMs / tickMs)));
+  let pos = 0;
+  const timer = setInterval(() => {
+    pos = Math.min(rest.length, pos + per);
+    target.innerHTML = multiline(rest.slice(0, pos));
+    if (pos >= rest.length) {
+      clearInterval(timer);
+      body.classList.remove('typing');
+      body.innerHTML = multiline(text);
+      node.scrollIntoView({ block: 'nearest' });
+    }
+  }, tickMs);
+}
+
+function syncStream(animate) {
+  const stream = $('#stream');
+  if (!stream || !state.detail) return;
+  const messages = state.detail.messages || [];
+  const rendered = state.streamRendered;
+  const prefixOk = state.streamSession === state.current
+    && messages.length >= rendered.length
+    && rendered.every((entry, index) => sameMsg(messages[index], entry.message));
+  if (!prefixOk) {
+    // 前缀对不上（切换会话、服务端重排、重连快照）：整段重建，不做动画。
+    removeOptimisticNodes();
+    state.streamRendered = [];
+    state.streamSession = state.current;
+    stream.innerHTML = '';
+  }
+  stream.querySelectorAll('.loading').forEach((node) => node.remove());
+  const from = state.streamRendered.length;
+  const tail = messages.slice(from);
+  const animateNew = Boolean(animate && from > 0);
+  // qopen 提前上屏的分隔线在权威消息里出现了：原节点无声替换，不能让同一条
+  // 分隔线再播一次入场动画，否则题面已经流完它才“闪”出来。
+  let reusedDividerText = null;
+  if (state.openDivider) {
+    const pendingDivider = state.openDivider;
+    const authoritative = tail.find((message) =>
+      message.anchor.endsWith(':open') && message.text === pendingDivider.text);
+    if (authoritative) {
+      pendingDivider.node.remove();
+      state.openDivider = null;
+      reusedDividerText = pendingDivider.text;
+    }
+  }
+  // 乐观/流式块固定在流尾；服务端节点插到它们前面，顺序与真实信息流一致。
+  const before = (state.optimistic.candidate && state.optimistic.candidate.node)
+    || (state.qstream && state.qstream.node)
+    || (state.optimistic.interviewer && state.optimistic.interviewer.node)
+    || null;
+  let lastInterviewer = null;
+  let lastNode = null;
+  let batchIndex = 0;
+  for (const message of tail) {
+    const quietDivider = reusedDividerText !== null
+      && message.anchor.endsWith(':open') && message.text === reusedDividerText;
+    const node = msgNode(message, animateNew && !quietDivider);
+    state.streamRendered.push({ message, node });
+    if (!node) continue;
+    // 同一批到达的多条消息错峰入场：依次延迟滑入，不再齐刷刷闪现。
+    if (animateNew && batchIndex > 0) {
+      node.style.animationDelay = `${Math.min(batchIndex * 90, 450)}ms`;
+    }
+    batchIndex += 1;
+    stream.insertBefore(node, before);
+    if (message.role === 'interviewer') lastInterviewer = node;
+    lastNode = node;
+  }
+  // 取代乐观候选人节点：服务端已给出同文本的候选人消息。
+  if (state.optimistic.candidate) {
+    const match = tail.some((message) => message.role === 'candidate'
+      && (message.text || '') === state.optimistic.candidate.text);
+    if (match) {
+      state.optimistic.candidate.node.remove();
+      state.optimistic.candidate = null;
+    }
+  }
+  // 面试官问题到达：终结真流式块或打字机兜底。
+  if (lastInterviewer) {
+    const finalText = lastInterviewer.dataset.text || '';
+    state.qstreamSettled = true; // 定稿后忽略可能迟到的 delta，防止幽灵块
+    if (state.qstream) {
+      const streamed = state.qstream;
+      state.qstream = null;
+      if (state.optimistic.interviewer) {
+        state.optimistic.interviewer.node.remove();
+        state.optimistic.interviewer = null;
+      }
+      // 定稿永远复用同一个流式节点：把它移动到服务端消息的真实位置，并用
+      // 权威文本收尾。服务端对文本做任何规范化（空白/转义/前缀）都不该让
+      // 已经逐字上屏的内容整块消失再重画；真正的重来只由 reset 事件触发。
+      streamed.node.dataset.text = finalText;
+      const body = streamed.node.querySelector('.msg-body');
+      if (body) {
+        body.classList.remove('typing');
+        // 已经逐字上屏且文本一致时不要碰 DOM：浏览器重建文本节点也会造成
+        // 一次可见的重绘。只有服务端确实改了文本才更新。
+        if (body.textContent !== finalText) body.innerHTML = multiline(finalText);
+      }
+      lastInterviewer.replaceWith(streamed.node);
+    } else {
+      if (state.optimistic.interviewer) {
+        state.optimistic.interviewer.node.remove();
+        state.optimistic.interviewer = null;
+      }
+      if (animate) {
+        startTyping(lastInterviewer);
+        if (lastNode) lastNode.scrollIntoView({ block: 'nearest' });
+      }
+    }
+  }
+  if (!stream.children.length) {
+    stream.innerHTML = '<div class="loading">正在准备题目…</div>';
+  }
+}
+
+// 事件锚移位：服务端截掉公共前缀之后的旧尾巴重发，这里同步删除对应节点。
+// detail.messages 必须和 streamRendered 一起截：它是服务端权威列表的本地镜像，
+// 漏截会让旧尾巴和新追加的 重发消息 拼成一份带重复的脏列表，
+// 下一次前缀失配触发整段重建时，重复和错序就会被整个渲染出来。
+function applyTruncate(payload) {
+  if (state.view !== 'detail' || !state.detail) return;
+  const keep = Math.max(0, Number(payload.keep) || 0);
+  for (let index = keep; index < state.streamRendered.length; index++) {
+    const entry = state.streamRendered[index];
+    if (entry.node) entry.node.remove();
+  }
+  state.streamRendered = state.streamRendered.slice(0, keep);
+  state.detail.messages = (state.detail.messages || []).slice(0, keep);
+}
+
+// 提交瞬间就把上一轮尾部的「等待候选人作答」撤掉：这是由 pending 派生的提示，
+// 候选人一提交它就不再成立。等服务端 truncate 到达再删，会出现它压在乐观回复
+// 上面、过一会儿又消失的回跳。三份镜像（DOM / streamRendered / detail.messages）
+// 必须一起截，否则下一次前缀比对会把旧尾巴又渲染出来。
+function dropTrailingWait() {
+  const rendered = state.streamRendered;
+  if (!rendered.length || !state.detail) return;
+  const last = rendered[rendered.length - 1];
+  const message = last && last.message;
+  if (!message || message.role !== 'system' || !message.text.includes('等待候选人作答')) return;
+  if (last.node) last.node.remove();
+  rendered.pop();
+  state.detail.messages.pop();
+}
+
+function appendOptimisticCandidate(answer) {
+  const stream = $('#stream');
+  if (!stream) return;
+  stream.querySelectorAll('.loading').forEach((node) => node.remove());
+  dropTrailingWait();
+  const text = answer || '（已提交空回答）';
+  const node = document.createElement('div');
+  node.className = 'msg candidate enter';
+  node.innerHTML = `<div class="msg-role">候选人</div>
+    <div class="msg-body">${multiline(text)}</div>`;
+  stream.appendChild(node);
+  node.scrollIntoView({ block: 'nearest' });
+  state.optimistic.candidate = { node, text };
+}
+
+function appendOptimisticInterviewer() {
+  const stream = $('#stream');
+  if (!stream) return;
+  const node = document.createElement('div');
+  node.className = 'msg interviewer enter';
+  node.innerHTML = `<div class="msg-role">面试官</div>
+    <div class="msg-body">${loadingBodyHtml()}</div>`;
+  stream.appendChild(node);
+  node.scrollIntoView({ block: 'nearest' });
+  state.optimistic.interviewer = { node };
+}
+
+// 分隔线先于题面 token 上屏：节点返回前 checkpoint 里还没有这道题，
+// 等 build_messages 的权威消息到达，syncStream 会用同样的文本换掉这个临时节点。
+function applyQOpen(payload) {
+  if (state.view !== 'detail') return;
+  const stream = $('#stream');
+  if (!stream) return;
+  // 上一题的收尾消息也会置 qstreamSettled=true；新题开流前必须复位，
+  // 否则第二题的 token 会被当成迟到增量全部丢掉。
+  state.qstreamSettled = false;
+  if (state.openDivider) state.openDivider.node.remove();
+  const text = `第 ${payload.index}/${payload.total} 题 · ${payload.topic || ''} · 难度 ${payload.difficulty || '—'}`;
+  const node = document.createElement('div');
+  node.className = 'q-divider';
+  node.innerHTML = `<span>${escapeHtml(text)}</span>`;
+  stream.appendChild(node);
+  state.openDivider = { node, text };
+  // 首题没有快评事件：分隔线出现后就挂 loading，保留到首个 token。
+  // 后续主问题若快评已经挂过块，这里直接复用，不造第二个。
+  if (!state.optimistic.interviewer && !state.qstream) appendOptimisticInterviewer();
+}
+
+// 真流式：模型 token 增量直达。加载态保留到首个 token，之后逐段上屏；
+// reset（格式错误重试）清空回加载态。定稿由 syncStream 在最终消息到达时完成。
+function applyQStream(payload) {
+  if (state.view !== 'detail') return;
+  if (payload.kind === 'reset') {
+    state.qstreamSettled = false;
+    if (state.qstream) {
+      state.qstream.text = '';
+      const body = state.qstream.node.querySelector('.msg-body');
+      if (body) {
+        body.classList.remove('typing');
+        body.innerHTML = loadingBodyHtml();
+      }
+    }
+    return;
+  }
+  if (payload.kind !== 'delta') return;
+  // 定稿后到达的迟到增量直接丢弃：这一题已经展示完毕。
+  if (state.qstreamSettled) return;
+  if (!state.qstream) {
+    const stream = $('#stream');
+    if (!stream) return;
+    stream.querySelectorAll('.loading').forEach((node) => node.remove());
+    if (state.optimistic.interviewer) {
+      // 提升：乐观加载块直接变成流式块，避免出现两个面试官块。
+      state.qstream = { node: state.optimistic.interviewer.node, text: '' };
+      state.optimistic.interviewer = null;
+    } else {
+      const node = document.createElement('div');
+      node.className = 'msg interviewer';
+      node.innerHTML = `<div class="msg-role">面试官</div><div class="msg-body"></div>`;
+      const before = (state.optimistic.candidate && state.optimistic.candidate.node)
+        || (state.openDivider && state.openDivider.node.nextSibling)
+        || null;
+      stream.insertBefore(node, before);
+      state.qstream = { node, text: '' };
+    }
+  }
+  state.qstream.text += payload.text || '';
+  const body = state.qstream.node.querySelector('.msg-body');
+  if (body) {
+    body.classList.add('typing');
+    body.innerHTML = multiline(state.qstream.text);
+  }
+  state.qstream.node.scrollIntoView({ block: 'nearest' });
+}
+
+// ---------- 详情视图：head / stream / bottom / metrics 四个分区 ----------
+
+function renderHead() {
+  const node = $('#detail-head');
+  if (!node) return;
+  const session = (state.detail && state.detail.session) || {};
   const chips = [
     ['主题', session.topic || '综合'],
     ['题数', session.num_questions || '—'],
@@ -307,67 +621,181 @@ function renderDetail(detail) {
   ].map(([label, value]) =>
     `<span class="meta-chip">${escapeHtml(label)}<b>${escapeHtml(value)}</b></span>`
   ).join('');
-  const messages = (detail.messages || [])
-    .filter((message) => !state.cleanMode || ['interviewer', 'candidate'].includes(message.role))
-    .map(renderMessage).join('')
-    || '<div class="loading">正在准备题目…</div>';
-  let bottom = '';
+  node.innerHTML = `<h2>面试对话</h2>
+    ${state.cleanMode ? '' : '<p class="card-sub">展示完整系统提示、对话及运行统计。</p>'}
+    <div class="meta-grid">${chips}</div>`;
+}
+
+function answerBoxHtml(locked) {
+  const stageLine = state.cleanMode ? '' : `<div class="stage-line" id="stage-line">${escapeHtml(stageText())}</div>`;
+  if (locked) {
+    // 只锁提交按钮；编辑框保持可交互，候选人可以预写下一轮草稿。
+    return `<div class="card answer-box locked">
+      <h2>已提交，等待面试官</h2>
+      ${state.error ? notice(state.error, 'error') : ''}
+      <textarea id="answer-input" placeholder=""></textarea>
+      <div class="answer-actions">
+        <button class="primary" type="button" disabled>等待面试官…</button>
+        <span class="answer-hint">面试官出题后会自动流式显示在对话里。</span>
+      </div>
+      ${stageLine}
+    </div>`;
+  }
+  return `<div class="card answer-box">
+    <h2>继续作答</h2>
+    ${state.error ? notice(state.error, 'error') : ''}
+    ${state.emptyConfirm ? notice('答案内容为空。再次点击「确认提交空回答」才会提交。', 'warn') : ''}
+    <textarea id="answer-input" placeholder="在这里输入回答；空白提交需要二次确认"></textarea>
+    <div class="answer-actions">
+      <button class="primary" type="button" data-action="submit-answer">
+        ${state.emptyConfirm ? '确认提交空回答' : '提交回答'}</button>
+      <span class="answer-hint">已提交的内容会保存，未提交的草稿不会保存。</span>
+    </div>
+  </div>`;
+}
+
+function workingCardHtml() {
+  return `${state.cleanMode ? '' : notice('面试官正在思考，结束后页面会自动刷新。')}
+    <div class="card">
+      <div class="working" role="status" aria-live="polite">
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="working-text">${state.cleanMode ? '面试官正在思考，请稍候…' : '请稍候，模型调用可能持续数十秒。'}</span>
+      </div>
+      ${state.cleanMode ? '' : `<div class="stage-line" id="stage-line">${escapeHtml(stageText())}</div>`}
+    </div>`;
+}
+
+function scoringCardHtml() {
+  const stageLine = state.cleanMode ? '' : `<div class="stage-line" id="stage-line">${escapeHtml(stageText())}</div>`;
+  return `<div class="card">
+    <div class="working" role="status" aria-live="polite">
+      <span class="spinner" aria-hidden="true"></span>
+      <span class="working-text">本题已结束，正在等待单题评分完成…</span>
+    </div>
+    ${stageLine}
+  </div>`;
+}
+
+function bottomSignature() {
+  const detail = state.detail || {};
+  const session = detail.session || {};
+  return JSON.stringify([
+    Boolean(detail.done), state.submitting, Boolean(detail.busy),
+    Boolean(detail.pending), detail.pending ? detail.pending.ask : '',
+    state.cleanMode, detail.scoring_pending ? 1 : 0,
+    `${session.completed || 0}/${session.num_questions || 0}`,
+  ]);
+}
+
+function renderBottom() {
+  const host = $('#detail-bottom');
+  if (!host) return;
+  // 分区重建不经过 render()：草稿在这里自己保留（提交后的清空靠 clearDraft）。
+  const previous = $('#answer-input');
+  const draft = previous ? previous.value : null;
+  const keepDraft = state.clearDraft ? null : draft;
+  const detail = state.detail || {};
+  const session = detail.session || {};
+  // 最后一题答完：不会再有下一题，等待区换成评分进行中的卡片，
+  // 不再摆一个永远不会被用到的输入框。
+  const lastDone = Boolean(session.num_questions)
+    && (session.completed || 0) >= session.num_questions;
+  let html;
   if (detail.done) {
-    bottom = `${notice('这场面试已完成，不能继续作答；以下为已保存的报告。', 'warn')}
+    html = `${notice('这场面试已完成，不能继续作答；以下为已保存的报告。', 'warn')}
       <div class="card"><h2>面试报告</h2>
         <div class="report" id="report-body">${state.reportFor === state.current
           ? state.reportHtml : '<div class="loading">正在读取报告…</div>'}</div>
       </div>`;
+  } else if (state.submitting && lastDone) {
+    html = scoringCardHtml();
+  } else if (detail.scoring_pending && !detail.pending && !detail.busy) {
+    html = scoringCardHtml();
+  } else if (state.submitting) {
+    html = answerBoxHtml(true);
   } else if (detail.busy) {
-    bottom = `${state.cleanMode ? '' : notice('面试官正在思考，结束后页面会自动刷新。')}
-      <div class="card">
-        <div class="working" role="status" aria-live="polite">
-          <span class="spinner" aria-hidden="true"></span>
-          <span class="working-text">${state.cleanMode ? '面试官正在思考，请稍候…' : '请稍候，模型调用可能持续数十秒。'}</span>
-        </div>
-        ${state.cleanMode ? '' : `<div class="stage-line" id="stage-line">${escapeHtml(stageText())}</div>`}
-      </div>`;
+    html = workingCardHtml();
   } else if (detail.pending) {
-    const pending = detail.pending;
-    const label = pending.kind === 'clarification' ? '题意澄清'
-      : pending.hop === 0 ? '主问' : `追问 ${pending.hop}/3`;
-    bottom = `<div class="card answer-box">
-      <h2>继续作答</h2>
-      <div class="answer-label"><span>第 ${pending.index + 1}/${pending.total} 题 · ${escapeHtml(pending.topic || '')}</span>
-        <b>${escapeHtml(label)}</b></div>
-      ${state.error ? notice(state.error, 'error') : ''}
-      ${state.emptyConfirm ? notice('答案内容为空。再次点击「确认提交空回答」才会提交。', 'warn') : ''}
-      <textarea id="answer-input" placeholder="在这里输入回答；空白提交需要二次确认"></textarea>
-      <div class="answer-actions">
-        <button class="primary" type="button" data-action="submit-answer">
-          ${state.emptyConfirm ? '确认提交空回答' : '提交回答'}</button>
-        <span class="answer-hint">已提交的内容会保存，未提交的草稿不会保存。</span>
-      </div>
-    </div>`;
+    html = answerBoxHtml(false);
   } else {
-    bottom = `<div class="card">
+    html = `<div class="card">
       <h2>这场面试可以恢复</h2>
       <p class="card-sub">当前没有等待回答的中断点，需要推进已落盘的步骤。</p>
       ${state.error ? notice(state.error, 'error') : ''}
       <button class="primary" type="button" data-action="resume">继续推进</button>
     </div>`;
   }
-  return `<div class="card">
-      <h2>面试对话</h2>
-      ${state.cleanMode ? '' : '<p class="card-sub">展示完整系统提示、对话及运行统计。</p>'}
-      <div class="meta-grid">${chips}</div>
-    </div>
-    <div class="card"><div class="stream">${messages}</div></div>
-    ${bottom}
-    ${state.cleanMode ? '' : renderMetrics(detail)}`;
+  host.innerHTML = html;
+  state.clearDraft = false;
+  state.bottomSig = bottomSignature();
+  if (keepDraft !== null) {
+    const next = $('#answer-input');
+    if (next && !next.value) next.value = keepDraft;
+  }
+}
+
+function renderMetricsCard() {
+  const host = $('#detail-metrics');
+  if (!host) return;
+  host.innerHTML = state.cleanMode ? '' : renderMetrics(state.detail || {});
+}
+
+function renderDetail() {
+  // 整体重建四个分区；信息流由 syncStream 从 state.detail.messages 重建。
+  // 纯净模式切换、重连 hello 都会走到这里：正在打字的问题还没进服务端消息，
+  // 必须把乐观块/流式块连同状态一起接回去，否则题面会突然消失再一次性出现。
+  const savedOptimistic = {
+    candidate: state.optimistic.candidate,
+    interviewer: state.optimistic.interviewer,
+    qstream: state.qstream,
+    openDivider: state.openDivider,
+  };
+  content.innerHTML = '';
+  const head = document.createElement('div');
+  head.id = 'detail-head';
+  head.className = 'card';
+  content.appendChild(head);
+  const streamCard = document.createElement('div');
+  streamCard.className = 'card';
+  streamCard.innerHTML = '<div class="stream" id="stream"></div>';
+  content.appendChild(streamCard);
+  const bottom = document.createElement('div');
+  bottom.id = 'detail-bottom';
+  content.appendChild(bottom);
+  const metrics = document.createElement('div');
+  metrics.id = 'detail-metrics';
+  content.appendChild(metrics);
+  renderHead();
+  renderBottom();
+  renderMetricsCard();
+  state.streamSession = null; // 强制信息流整段重建
+  syncStream(false);
+  // syncStream 重建时会清掉临时块，这里按原顺序接回流尾。
+  state.optimistic = {
+    candidate: savedOptimistic.candidate,
+    interviewer: savedOptimistic.interviewer,
+  };
+  state.qstream = savedOptimistic.qstream;
+  state.openDivider = savedOptimistic.openDivider;
+  const streamHost = $('#stream');
+  if (streamHost) {
+    for (const node of [
+      savedOptimistic.candidate && savedOptimistic.candidate.node,
+      savedOptimistic.openDivider && savedOptimistic.openDivider.node,
+      savedOptimistic.qstream && savedOptimistic.qstream.node,
+      savedOptimistic.interviewer && savedOptimistic.interviewer.node,
+    ]) {
+      if (node) streamHost.appendChild(node);
+    }
+  }
 }
 
 function render() {
   const previous = $('#answer-input');
-  const draft = previous ? previous.value : null;
+  const draft = previous && !previous.disabled ? previous.value : null;
   syncCleanToggle();
   if (state.view === 'new') content.innerHTML = renderNew();
-  else if (state.view === 'detail' && state.detail) content.innerHTML = renderDetail(state.detail);
+  else if (state.view === 'detail' && state.detail) renderDetail();
   else content.innerHTML = renderEmpty();
   const next = $('#answer-input');
   if (next && draft !== null && !state.clearDraft) next.value = draft;
@@ -385,30 +813,140 @@ function readForm() {
   };
 }
 
-function scheduleStatus(delay = 1200) {
-  if (state.timer) clearTimeout(state.timer);
-  state.timer = setTimeout(() => pollStatus(), delay);
+// ---------- SSE 事件通道：hello 快照 / append 增量 / state 状态 ----------
+
+function subscribe(sessionId) {
+  if (state.es) { state.es.close(); state.es = null; }
+  if (!sessionId) return;
+  const es = new EventSource(`api/interviews/${encodeURIComponent(sessionId)}/events`);
+  es.onmessage = (event) => {
+    let payload;
+    try { payload = JSON.parse(event.data); } catch (_) { return; }
+    if (payload.type === 'hello') applyHello(payload);
+    else if (payload.type === 'append') applyAppend(payload);
+    else if (payload.type === 'truncate') applyTruncate(payload);
+    else if (payload.type === 'state') applyState(payload);
+    else if (payload.type === 'qstream') applyQStream(payload);
+    else if (payload.type === 'qopen') applyQOpen(payload);
+  };
+  es.onerror = () => {
+    // 只有连接彻底关闭（例如令牌失效返回 401）才回登录页；
+    // 普通断线由 EventSource 自动重连，重连后的 hello 会重新同步全量。
+    if (es.readyState === EventSource.CLOSED) {
+      window.dispatchEvent(new CustomEvent('auth-lost'));
+    }
+  };
+  state.es = es;
 }
 
-async function pollStatus() {
-  if (state.view !== 'detail' || !state.current) return;
-  try {
-    const status = await api(`/api/interviews/${encodeURIComponent(state.current)}/status`);
-    const changed = status.revision !== state.revision;
-    const turnFinished = state.lastBusy && !status.busy;
-    state.stage = status;
-    if (changed || turnFinished) {
-      await refreshDetail();
-      return;
-    }
-    // Nothing new: update only the stage line, never rebuild the answer box.
-    updateStageLine();
-    state.lastBusy = status.busy;
-    if (status.busy || status.scoring_pending) scheduleStatus();
-  } catch (error) {
-    state.error = error.message;
-    render();
+function applyHello(payload) {
+  if (state.view !== 'detail') return;
+  if (!payload.busy) state.submitting = false;
+  state.detail = {
+    session: payload.session,
+    messages: payload.messages || [],
+    pending: payload.pending,
+    done: payload.done,
+    busy: payload.busy,
+    scoring_pending: payload.scoring_pending,
+    initializing: payload.initializing,
+    revision: payload.revision,
+    metrics: payload.metrics || [],
+    metrics_summary: payload.metrics_summary || {},
+  };
+  state.revision = payload.revision;
+  state.stage = {
+    stage: payload.stage,
+    stage_ms: payload.stage_ms,
+    last_stage: payload.last_stage,
+  };
+  render();
+  updatePassStatus();
+  loadSessions();
+  if (state.detail.done) loadReport(true);
+}
+
+function applyAppend(payload) {
+  if (state.view !== 'detail' || !state.detail) return;
+  const items = payload.items || [];
+  state.detail.messages = [...(state.detail.messages || []), ...items];
+  syncStream(true);
+  // 快评落地之后、下一道题开流之前，才挂面试官的 loading 块。
+  // 若同一批已经带最终面试官消息，就不需要再挂临时块。
+  const decided = items.some((message) =>
+    message.role === 'system' && message.text.startsWith('快评决策'));
+  const answered = items.some((message) => message.role === 'interviewer');
+  if (decided && !answered && state.submitting && !state.optimistic.interviewer) {
+    appendOptimisticInterviewer();
   }
+}
+
+async function refreshTimings() {
+  if (!state.current) return;
+  try {
+    const result = await api(`/api/interviews/${encodeURIComponent(state.current)}/timings`);
+    if (state.detail) {
+      state.detail.metrics = result.stages || [];
+      state.detail.metrics_summary = result.summary || {};
+    }
+    renderMetricsCard();
+  } catch (_) {
+    // 指标是辅助信息，失败不打扰面试流程。
+  }
+}
+
+function applyState(payload) {
+  if (state.view !== 'detail') return;
+  const detail = state.detail || {};
+  const revisionChanged = payload.revision !== state.revision;
+  const wasDone = detail.done;
+  state.revision = payload.revision;
+  state.stage = {
+    stage: payload.stage,
+    stage_ms: payload.stage_ms,
+    last_stage: payload.last_stage,
+  };
+  detail.busy = payload.busy;
+  detail.done = payload.done;
+  detail.pending = payload.pending;
+  detail.scoring_pending = payload.scoring_pending;
+  detail.session = payload.session;
+  state.detail = detail;
+  if (!payload.busy) {
+    // 正常路径里最终消息已经先 append、syncStream 也已完成定稿，这里通常
+    // 没有临时块要处理。若 busy=false 抢在定稿之前到达，不能立刻把逐字输出
+    // 砍掉；给它一点时间等最终消息。模型失败、没有最终消息时才撤掉残块。
+    state.submitting = false;
+    const staleInterviewer = state.optimistic.interviewer;
+    const staleStream = state.qstream;
+    const staleDivider = state.openDivider;
+    if (staleInterviewer || staleStream || staleDivider) {
+      setTimeout(() => {
+        if (state.detail && state.detail.busy) return;
+        if (staleInterviewer && state.optimistic.interviewer === staleInterviewer) {
+          staleInterviewer.node.remove();
+          state.optimistic.interviewer = null;
+        }
+        if (staleStream && state.qstream === staleStream) {
+          staleStream.node.remove();
+          state.qstream = null;
+        }
+        if (staleDivider && state.openDivider === staleDivider) {
+          staleDivider.node.remove();
+          state.openDivider = null;
+        }
+      }, 800);
+    }
+  }
+  updateStageLine();
+  renderHead();
+  if (bottomSignature() !== state.bottomSig) renderBottom();
+  if (revisionChanged) {
+    loadSessions();
+    updatePassStatus();
+    refreshTimings();
+  }
+  if (detail.done && !wasDone) loadReport(true);
 }
 
 async function loadSessions() {
@@ -438,25 +976,6 @@ async function loadReport(force = false) {
   if (node) node.innerHTML = state.reportHtml;
 }
 
-async function refreshDetail() {
-  if (state.view !== 'detail' || !state.current) return;
-  try {
-    const detail = await api(`/api/interviews/${encodeURIComponent(state.current)}`);
-    state.detail = detail;
-    state.revision = detail.revision;
-    state.lastBusy = detail.busy;
-    state.error = '';
-    render();
-    updatePassStatus();
-    if (detail.done) await loadReport(true);
-    await loadSessions();
-    if (detail.busy || detail.scoring_pending) scheduleStatus();
-  } catch (error) {
-    state.error = error.message;
-    render();
-  }
-}
-
 async function openSession(id) {
   state.current = id;
   state.view = 'detail';
@@ -464,14 +983,21 @@ async function openSession(id) {
   state.reportFor = null;
   state.reportHtml = '';
   state.revision = null;
-  state.lastBusy = false;
   state.stage = null;
   state.error = '';
   state.emptyConfirm = false;
   state.clearDraft = true;
+  state.streamRendered = [];
+  state.streamSession = null;
+  state.optimistic = { candidate: null, interviewer: null };
+  state.qstream = null;
+  state.qstreamSettled = false;
+  state.submitting = false;
+  state.bottomSig = '';
   renderSessions();
   content.innerHTML = '<div class="card"><div class="loading">正在读取会话…</div></div>';
-  await refreshDetail();
+  // 连接即同步：服务端 hello 快照负责首屏渲染，之后全部走增量事件。
+  subscribe(id);
 }
 
 function passStatusText(info) {
@@ -517,6 +1043,7 @@ async function showMain() {
 function showLogin() {
   $('#main-view').hidden = true;
   $('#login-view').hidden = false;
+  if (state.es) { state.es.close(); state.es = null; }
   state.user = null;
   state.pass = null;
   state.current = null;
@@ -569,6 +1096,7 @@ $('#new-btn').addEventListener('click', () => {
   state.detail = null;
   state.error = '';
   state.form = { select: '', custom: '', num: '', resume: '', jds: [] };
+  if (state.es) { state.es.close(); state.es = null; }
   renderSessions();
   render();
 });
@@ -586,6 +1114,7 @@ content.addEventListener('click', async (event) => {
     if (action === 'cancel') {
       state.view = 'empty';
       state.error = '';
+      if (state.es) { state.es.close(); state.es = null; }
       render();
     } else if (action === 'add-jd' || action === 'remove-jd') {
       readForm();
@@ -624,19 +1153,33 @@ content.addEventListener('click', async (event) => {
       state.error = '';
       state.emptyConfirm = false;
       state.clearDraft = true;
-      await api(`/api/interviews/${encodeURIComponent(state.current)}/answer`, {
-        method: 'POST',
-        body: JSON.stringify({ answer, confirm_empty: !answer.trim() }),
-      });
-      state.detail = { ...state.detail, busy: true };
-      render();
-      scheduleStatus(400);
+      state.qstreamSettled = false;
+      // 乐观流水线：按钮与输入区立即锁定 → 候选人回复入流 → 面试官加载块。
+      // 之后由 SSE append 事件接管：候选人消息被服务端数据取代、加载块换成打字机。
+      state.submitting = true;
+      renderBottom();
+      // 只先把候选人的回复顶上去。事实时序是「提交 → 快评 → 出题」，
+      // 面试官的 loading 等快评消息到达再出现，不能抢在快评前面。
+      appendOptimisticCandidate(answer);
+      try {
+        await api(`/api/interviews/${encodeURIComponent(state.current)}/answer`, {
+          method: 'POST',
+          body: JSON.stringify({ answer, confirm_empty: !answer.trim() }),
+        });
+      } catch (error) {
+        removeOptimisticNodes();
+        state.submitting = false;
+        state.error = error.message;
+        renderBottom();
+        const input = $('#answer-input');
+        if (input) input.value = answer;
+      }
     } else if (action === 'resume') {
       state.error = '';
+      state.qstreamSettled = false;
       await api(`/api/interviews/${encodeURIComponent(state.current)}/resume`, { method: 'POST' });
-      state.detail = { ...state.detail, busy: true };
-      render();
-      scheduleStatus(400);
+      state.detail = { ...(state.detail || {}), busy: true };
+      renderBottom();
     }
   } catch (error) {
     state.error = error.message;

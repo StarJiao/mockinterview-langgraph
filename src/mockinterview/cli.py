@@ -216,7 +216,7 @@ def show_history(console: Console, state: dict) -> set[str]:
         if answered:
             console.separator(f"历史 · 第 {index} 题 · {question.get('topic', '')}")
             for round_index, round_ in answered:
-                label = round_label(question, round_index, with_limit=True)
+                label = round_label(question, round_index, with_limit=True, qno=index)
                 console.say("面试官", f"{label}：{round_['ask']}")
                 console.say("你", round_["answer"] or "（已提交空回答）")
         if question.get("closing"):
@@ -500,7 +500,7 @@ async def run(args) -> int:
                     label = (
                         "题意澄清"
                         if pending.get("kind") == "clarification"
-                        else "主问"
+                        else f"主问{pending['index'] + 1}"
                         if pending["hop"] == 0
                         else f"追问 {pending['hop']}/{MAX_PROBES}"
                     )

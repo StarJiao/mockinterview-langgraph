@@ -16,6 +16,7 @@ All interview rules live in the graph; this layer only drives it.
 """
 
 import asyncio
+import json
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -25,7 +26,13 @@ from urllib.parse import quote, unquote
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
 
 from .report import render_report
@@ -75,7 +82,9 @@ def build_messages(state: dict, pending: dict | None, events: list[dict]) -> lis
 
     Interviewer/candidate lines come from Graph State, so old CLI sessions replay
     correctly. System lines are derived from persisted decisions, plus recorded
-    Web notifications anchored to the round that produced them.
+    Web notifications anchored to the round that produced them. "等待候选人作答"
+    is a real recorded event anchored just after its question: it is part of the
+    conversation history and must not vanish once the answer arrives.
     """
     options = state.get("options", {})
     questions = state.get("questions", [])
@@ -110,7 +119,7 @@ def build_messages(state: dict, pending: dict | None, events: list[dict]) -> lis
             add(
                 "interviewer",
                 "面试官",
-                f"{round_label(question, ri, with_limit=True)}：{round_['ask']}",
+                f"{round_label(question, ri, with_limit=True, qno=qi)}：{round_['ask']}",
                 anchor,
             )
             answer = round_.get("answer")
@@ -154,26 +163,56 @@ def build_messages(state: dict, pending: dict | None, events: list[dict]) -> lis
             "end",
         )
     elif pending:
-        add("system", "系统", "等待候选人作答", "end")
+        # 老会话没有落库的等待事件：仍按旧方式在当前流尾补一条，避免升级后
+        # 正在进行的面试完全没有等待提示。新会话走下面的落库事件路径。
+        pending_round = None
+        for question in questions:
+            if question["id"] == pending["question_id"]:
+                pending_round = f"q:{question['id']}:r{len(question.get('rounds', [])) - 1}"
+                break
+        recorded_waits = {
+            event["anchor"][: -len(":wait")]
+            for event in events
+            if event["anchor"].endswith(":wait")
+        }
+        if pending_round and pending_round not in recorded_waits:
+            add("system", "系统", "等待候选人作答", "end")
 
     by_anchor: dict[str, list[dict]] = defaultdict(list)
+    waits_by_round: dict[str, list[dict]] = defaultdict(list)
+    submits_by_round: dict[str, list[dict]] = defaultdict(list)
     for event in events:
-        by_anchor[event["anchor"]].append(
-            {
-                "role": event["role"],
-                "label": "系统" if event["role"] == "system" else event["role"],
-                "text": event["text"],
-                "anchor": event["anchor"],
-            }
-        )
+        item = {
+            "role": event["role"],
+            "label": "系统" if event["role"] == "system" else event["role"],
+            "text": event["text"],
+            "anchor": event["anchor"],
+        }
+        anchor = event["anchor"]
+        if anchor.endswith(":wait") and event["text"] == "等待候选人作答":
+            waits_by_round[anchor[: -len(":wait")]].append(item)
+        elif anchor.endswith(":submit") or event["text"].startswith("候选人已提交本轮回答"):
+            # 提交发生在快评之前，展示也必须如此。:submit 是新事件的锚点后缀；
+            # 老事件没有后缀，靠文本识别，升级前的会话同样排出正确顺序。
+            submits_by_round[anchor.removesuffix(":submit")].append(item)
+        else:
+            by_anchor[anchor].append(item)
     stream = []
     for index, message in enumerate(base):
         stream.append(message)
-        last_of_anchor = index == len(base) - 1 or base[index + 1]["anchor"] != message["anchor"]
+        anchor = message["anchor"]
+        # 等待提示紧跟面试官消息；提交确认紧跟候选人回答；
+        # 两者都必须早于同一回合的快评决策。
+        if message["role"] == "interviewer" and anchor in waits_by_round:
+            stream.extend(waits_by_round.pop(anchor))
+        if message["role"] == "candidate" and anchor in submits_by_round:
+            stream.extend(submits_by_round.pop(anchor))
+        last_of_anchor = index == len(base) - 1 or base[index + 1]["anchor"] != anchor
         if last_of_anchor:
-            stream.extend(by_anchor.pop(message["anchor"], []))
-    for anchor in sorted(by_anchor):
-        stream.extend(by_anchor[anchor])
+            stream.extend(by_anchor.pop(anchor, []))
+    for group in (waits_by_round, submits_by_round, by_anchor):
+        for anchor in sorted(group):
+            stream.extend(group[anchor])
     return stream
 
 
@@ -210,17 +249,30 @@ class WebService:
         self.notify = notify or (lambda text: print(f"[系统] {str(text).replace(chr(27), '')}"))
         self.tasks: dict[str, asyncio.Task] = {}
         self.locks: dict[str, asyncio.Lock] = {}
+        self.stream_subs: dict[str, set] = defaultdict(set)
+        # 服务关闭信号：SSE 生成器据此自行结束，否则 uvicorn 会一直等连接排空。
+        self.stopping = asyncio.Event()
         self._guard = asyncio.Lock()
         self.stage = StageTracker()
 
+    def emit_stream(self, session_id: str, event: dict):
+        """Fan a streaming delta out to every subscribed SSE client."""
+        for queue in self.stream_subs.get(session_id, ()):
+            queue.put_nowait(event)
+
     async def open(self):
         self.app = InterviewApp(
-            self.data_dir, self.backend, notify=self.notify, stage_tracker=self.stage
+            self.data_dir,
+            self.backend,
+            notify=self.notify,
+            stage_tracker=self.stage,
+            emitter=self.emit_stream,
         )
         await self.app.__aenter__()
         self.store = self.app.store
 
     async def close(self):
+        self.stopping.set()
         running = [task for task in self.tasks.values() if not task.done()]
         for task in running:
             task.cancel()
@@ -247,10 +299,32 @@ class WebService:
                 raise HTTPException(status_code=409, detail="这场面试正在处理上一轮，请稍候")
             self.tasks[session_id] = asyncio.create_task(self._run(session_id, factory))
 
+    async def _record_waiting(self, session_id: str):
+        """Persist the waiting hint for the round that just became pending.
+
+        It used to be derived from `pending` on every read, so submitting an
+        answer erased the line that had been sitting above that answer. Recording
+        it once keeps the conversation history intact; the anchor suffix places
+        it directly after the interviewer message in build_messages.
+        """
+        try:
+            turn = await self.app.inspect(session_id)
+        except ValueError:
+            return
+        anchor = pending_anchor(turn)
+        if anchor == "end":
+            return
+        wait_anchor = f"{anchor}:wait"
+        events = await self.store.events(session_id)
+        if any(event["anchor"] == wait_anchor for event in events):
+            return
+        await self.store.add_event(session_id, wait_anchor, "等待候选人作答")
+
     async def _run(self, session_id: str, factory):
         async with self._lock(session_id):
             try:
                 await factory()
+                await self._record_waiting(session_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -385,6 +459,54 @@ def session_meta(session_id: str, state: dict, pending: dict | None, done: bool)
         "has_resume": bool(options.get("resume", "").strip()),
         "demo": bool(options.get("demo", False)),
         "tokens": sum(state.get("usage", {}).values()),
+    }
+
+
+def sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+
+
+def stream_delta(sent: list[dict] | None, messages: list[dict]) -> dict:
+    """Describe the step from the previously sent message list to the new one.
+
+    The list is NOT strictly append-only: events anchored to a round (e.g.
+    「候选人已提交本轮回答」) shift forward once that round gains its answer
+    and decision messages. A plain prefix check therefore degenerated into a
+    full hello on every turn completion, wiping the streaming UI. Instead:
+    longest common prefix, truncate the shifted tail, re-append from there.
+    """
+    if sent is None:
+        return {"kind": "hello"}
+    common = 0
+    limit = min(len(messages), len(sent))
+    while common < limit and messages[common] == sent[common]:
+        common += 1
+    if common == len(sent) and len(messages) == len(sent):
+        return {"kind": "none"}
+    return {"kind": "truncate", "keep": common, "items": messages[common:]}
+
+
+def event_state(
+    service: WebService,
+    session_id: str,
+    turn,
+    busy: bool,
+    revision: str,
+) -> dict:
+    """Common fields shared by every SSE event type."""
+    stage = service.stage.current(session_id)
+    recent = service.stage.recent(session_id)
+    return {
+        "session": session_meta(session_id, turn.state, turn.pending, turn.done),
+        "pending": turn.pending,
+        "done": turn.done,
+        "busy": busy,
+        "scoring_pending": service.scoring_pending(session_id),
+        "initializing": False,
+        "revision": revision,
+        "stage": stage["label"] if stage else None,
+        "stage_ms": stage["ms"] if stage else 0,
+        "last_stage": recent[-1] if recent else None,
     }
 
 
@@ -623,6 +745,127 @@ def create_app(service: WebService) -> FastAPI:
             "last_stage": recent[-1] if recent else None,
         }
 
+    @app.get("/api/interviews/{session_id}/events")
+    async def events(
+        session_id: str,
+        request: Request,
+        username: str = Depends(current_user),
+        service: WebService = Depends(service_of),
+    ):
+        """SSE channel: hello snapshot, then truncate/append/state deltas.
+
+        build_messages is not strictly append-only: events anchored to a round
+        shift when that round gains its answer. stream_delta therefore sends
+        the longest common prefix plus a shifted tail instead of a full hello.
+        Authoritative messages/state are always emitted before queued token
+        deltas, so a new question never streams ahead of the answer and system
+        messages that belong to the previous turn. State events carry
+        busy/pending/stage so the client needs no polling loop.
+        """
+        await require_owned(session_id, username, service)
+        # ?once=1 makes the generator emit exactly one cycle and return.
+        # Production streams forever; httpx's ASGITransport however waits for
+        # the ASGI call to finish, so contract tests pin the endpoint to one
+        # cycle instead of hanging on an endless stream.
+        single_cycle = "once" in request.query_params
+
+        async def generate():
+            sent: list[dict] | None = None
+            sent_state: str | None = None
+            announced_init = False
+            sub_queue: asyncio.Queue = asyncio.Queue()
+            service.stream_subs[session_id].add(sub_queue)
+            # 睡眠期间到达的 token 先存在这里，下一轮 tick 之后再发。
+            held_stream: dict | None = None
+            try:
+                while True:
+                    if service.stopping.is_set() or await request.is_disconnected():
+                        return
+                    # 先把权威消息同步到客户端：候选人回答、提交事件、等待提示
+                    # 的清除都必须在下一道题开流之前完成。之前反过来冲刷，
+                    # 前端会先看到新题 token、再看到上一轮的回答插到它上面，
+                    # 视觉上就成了消息回跳。
+                    try:
+                        turn = await service.app.inspect(session_id)
+                    except ValueError:
+                        if not announced_init:
+                            announced_init = True
+                            yield sse(
+                                {
+                                    "type": "hello",
+                                    "session": {"id": session_id, "status": "初始化中"},
+                                    "messages": [],
+                                    "pending": None,
+                                    "done": False,
+                                    "busy": service.busy(session_id),
+                                    "scoring_pending": False,
+                                    "initializing": True,
+                                    "revision": await service.store.revision(session_id),
+                                    "metrics": [],
+                                    "metrics_summary": {},
+                                    "stage": None,
+                                    "stage_ms": 0,
+                                    "last_stage": None,
+                                }
+                            )
+                        await asyncio.sleep(1.0)
+                        continue
+                    announced_init = False
+                    busy = service.busy(session_id)
+                    revision = await service.store.revision(session_id)
+                    common = event_state(service, session_id, turn, busy, revision)
+                    events_list = await service.store.events(session_id)
+                    messages = build_messages(turn.state, turn.pending, events_list)
+                    signature = json.dumps(common, ensure_ascii=False, default=str, sort_keys=True)
+                    delta = stream_delta(sent, messages)
+                    if delta["kind"] == "hello":
+                        yield sse(
+                            {
+                                **common,
+                                "type": "hello",
+                                "messages": messages,
+                                "metrics": await service.store.stage_metrics(session_id),
+                                "metrics_summary": await service.store.stage_summary(session_id),
+                            }
+                        )
+                        # hello already carries every state field; don't echo a
+                        # redundant state event in the same cycle.
+                        sent_state = signature
+                    elif delta["kind"] == "truncate":
+                        if delta["keep"] < len(sent):
+                            yield sse({"type": "truncate", "keep": delta["keep"]})
+                        if delta["items"]:
+                            yield sse({"type": "append", "items": delta["items"]})
+                    sent = messages
+                    active = busy or common["scoring_pending"]
+                    if active or signature != sent_state:
+                        yield sse({"type": "state", **common})
+                        sent_state = signature
+                    # tick 结束再放 token：此时同一轮的历史消息已经就位。
+                    if held_stream is not None:
+                        yield sse(held_stream)
+                        held_stream = None
+                    while not sub_queue.empty():
+                        yield sse(sub_queue.get_nowait())
+                    if single_cycle:
+                        return
+                    # busy 时 tick 收紧到 0.4s；token 到达时提前唤醒，
+                    # 不必等满一个 tick 才把首字送到前端。
+                    delay = 0.4 if active else 1.5
+                    wake = asyncio.create_task(sub_queue.get())
+                    try:
+                        held_stream = await asyncio.wait_for(wake, timeout=delay)
+                    except asyncio.TimeoutError:
+                        wake.cancel()
+            finally:
+                service.stream_subs[session_id].discard(sub_queue)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.get("/api/interviews/{session_id}/timings")
     async def timings(
         session_id: str,
@@ -665,7 +908,7 @@ def create_app(service: WebService) -> FastAPI:
             raise HTTPException(status_code=400, detail="回答过长（上限 20000 字）")
         await service.store.link_pass_session(request.state.pass_row["id"], session_id)
         await service.store.add_event(
-            session_id, pending_anchor(turn), "候选人已提交本轮回答，等待生成下一步"
+            session_id, f"{pending_anchor(turn)}:submit", "候选人已提交本轮回答，等待生成下一步"
         )
         await service.launch(
             session_id, lambda: service.app.resume(session_id, answer=body.answer)
@@ -719,6 +962,26 @@ async def serve(
     service = WebService(backend, Path(data_dir), options_base, notify=notify, env_path=env_path)
     application = create_app(service)
     server = uvicorn.Server(
-        uvicorn.Config(application, host=host, port=port, log_level="info")
+        uvicorn.Config(
+            application,
+            host=host,
+            port=port,
+            log_level="info",
+            # 兜底：即便有连接没排空，也不无限期卡在 shutdown。
+            timeout_graceful_shutdown=5,
+        )
     )
-    await server.serve()
+
+    async def watch_shutdown():
+        # CTRL+C / SIGTERM 后 uvicorn 只会拒绝新请求，不会主动掐断
+        # 永不结束的 SSE 流；这里把退出信号转成停止标志，让生成器自己返回。
+        while not server.should_exit:
+            await asyncio.sleep(0.2)
+        service.stopping.set()
+
+    watcher = asyncio.create_task(watch_shutdown())
+    try:
+        await server.serve()
+    finally:
+        service.stopping.set()
+        watcher.cancel()

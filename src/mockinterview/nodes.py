@@ -9,9 +9,20 @@ from .telemetry import null_stage
 
 
 class Nodes:
-    def __init__(self, backend, store, jobs, notify, recorder=None):
+    def __init__(self, backend, store, jobs, notify, recorder=None, emitter=None):
         self.backend, self.store, self.jobs, self.notify = backend, store, jobs, notify
         self.recorder = recorder
+        # emitter(session_id, event) 把出题/追问的流式增量发给 Web 层；CLI 传 None。
+        self.emitter = emitter
+
+    def _stream_sink(self, session_id: str):
+        if self.emitter is None:
+            return None
+        return lambda event: self.emitter(session_id, {"type": "qstream", **event})
+
+    def _emit(self, session_id: str, event: dict):
+        if self.emitter is not None:
+            self.emitter(session_id, event)
 
     async def call(self, state: dict, key: str, invoke):
         session_id = state["session_id"]
@@ -75,10 +86,25 @@ class Nodes:
             usage = {}
         else:
             self.notify(f"正在生成第 {index + 1} 题：{topic['topic']}")
+            # 分隔线属于这一题的开头，必须在 token 之前上屏。它对应的 checkpoint
+            # 消息要等节点返回才存在，所以先发一条显示用事件；定稿时再由
+            # build_messages 的权威消息替换，文本与 order 完全一致。
+            self._emit(
+                state["session_id"],
+                {
+                    "type": "qopen",
+                    "index": index + 1,
+                    "total": len(state["plan"]),
+                    "topic": topic.get("topic", ""),
+                    "difficulty": topic.get("difficulty", "—"),
+                },
+            )
             draft, usage = await self.call(
                 state,
                 f"question:{index}",
-                lambda: self.backend.question(topic, index + 1, len(state["plan"])),
+                lambda: self.backend.question(
+                    topic, index + 1, len(state["plan"]), on_delta=self._stream_sink(state["session_id"])
+                ),
             )
         questions = deepcopy(state["questions"])
         questions.append(
@@ -159,7 +185,9 @@ class Nodes:
         ask, usage = await self.call(
             state,
             f"probe:v2:{q['id']}:{round_index}",
-            lambda: self.backend.probe(q, state["decision"]["target"], hop),
+            lambda: self.backend.probe(
+                q, state["decision"]["target"], hop, on_delta=self._stream_sink(state["session_id"])
+            ),
         )
         if not ask.strip():
             raise ValueError("追问文本为空")

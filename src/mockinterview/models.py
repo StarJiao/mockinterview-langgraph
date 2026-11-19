@@ -1,11 +1,16 @@
 """LangChain model adapters and an explicitly fake offline backend.
 
 Responses are collected via ainvoke, validated, and returned to the Graph.
-The CLI displays only checkpointed questions; partial model output never leaks
-onto the screen. No native tool/schema feature is required from an OpenAI-
-compatible endpoint: Pydantic validates JSON locally with one repair attempt.
+The Web UI additionally streams provisional output: callers may pass on_delta
+to receive text pieces as they arrive (raw text for probe, the "text" field
+parsed out of the JSON buffer for question). Streamed pieces are display-only
+and provisional — a validation failure or correction emits a reset and the
+final validated text always replaces whatever was streamed. No native
+tool/schema feature is required from an OpenAI-compatible endpoint: Pydantic
+validates JSON locally with one repair attempt.
 """
 
+import asyncio
 import json
 import re
 from typing import Callable, TypeVar
@@ -110,8 +115,54 @@ def _tidy_line(text: str) -> str:
         text = text[3:-3].strip()
     for left, right in [('"', '"'), ("「", "」"), ("“", "”")]:
         if len(text) > 2 and text.startswith(left) and text.endswith(right):
-            text = text[len(left) : -len(right)].strip()
+            return text[len(left) : -len(right)].strip()
     return text
+
+
+_TEXT_KEY = re.compile(r'"text"\s*:\s*"')
+_STRING_ESCAPES = {
+    '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+}
+
+
+def _text_field_value(buffer: str) -> tuple[str, bool] | None:
+    """Incrementally extract the unescaped value of the "text" JSON field.
+
+    Returns (value, closed) — closed marks the terminating quote seen — or
+    None while the key has not appeared. A dangling backslash or an
+    incomplete \\u sequence at the buffer end is withheld until its bytes
+    arrive, so the caller never emits a character twice or prematurely.
+    """
+    match = _TEXT_KEY.search(buffer)
+    if match is None:
+        return None
+    out: list[str] = []
+    index = match.end()
+    length = len(buffer)
+    while index < length:
+        char = buffer[index]
+        if char == '"':
+            return "".join(out), True
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        if index + 1 >= length:
+            break
+        escape = buffer[index + 1]
+        if escape == "u":
+            hex_part = buffer[index + 2 : index + 6]
+            if len(hex_part) < 4:
+                break
+            try:
+                out.append(chr(int(hex_part, 16)))
+            except ValueError:
+                out.append(hex_part)
+            index += 6
+            continue
+        out.append(_STRING_ESCAPES.get(escape, escape))
+        index += 2
+    return "".join(out), False
 
 
 class ModelBackend:
@@ -140,6 +191,9 @@ class ModelBackend:
                 max_retries=2,
                 temperature=0.5,
                 use_responses_api=False,
+                # Token accounting must survive the switch to astream: the
+                # usage ride-along on the final streamed chunk.
+                stream_usage=True,
             )
         )
         self.evaluator = (
@@ -156,20 +210,59 @@ class ModelBackend:
             )
         )
 
-    async def _structured(
-        self, model, messages: list, schema: type[T], validate=None
-    ) -> CallResult:
+    async def _astream_text(self, model, messages, on_delta=None, json_field=False):
+        """Stream tokens; returns (full_text, tokens).
+
+        on_delta receives {"kind": "delta", "text": piece} events. With
+        json_field=True the pieces are the incrementally parsed "text" field
+        of a JSON object being emitted; otherwise pieces are the raw text.
+        """
+        buffer = ""
+        total = 0
+        emitted = ""
+        async for chunk in model.astream(messages):
+            usage = _tokens(chunk)
+            if usage:
+                total = usage
+            piece = _content(chunk)
+            if not piece:
+                continue
+            buffer += piece
+            if on_delta is None:
+                continue
+            if json_field:
+                extracted = _text_field_value(buffer)
+                if extracted is None:
+                    continue
+                value = extracted[0]
+                if len(value) > len(emitted) and value.startswith(emitted):
+                    on_delta({"kind": "delta", "text": value[len(emitted) :]})
+                    emitted = value
+            else:
+                on_delta({"kind": "delta", "text": piece})
+        return buffer, total
+
+    async def _structured(self, model, messages, schema, validate=None, on_delta=None):
         messages = list(messages)
         total = 0
         for attempt in range(2):
+            if attempt and on_delta:
+                # 上一次流出的是半成品，纠错重试前通知前端清空重来。
+                on_delta({"kind": "reset"})
             try:
-                message = await model.ainvoke(messages)
+                if on_delta is None:
+                    message = await model.ainvoke(messages)
+                    text = _content(message)
+                    total += _tokens(message)
+                else:
+                    text, attempt_tokens = await self._astream_text(
+                        model, messages, on_delta=on_delta, json_field=True
+                    )
+                    total += attempt_tokens
             except Exception as exc:
                 if total:
                     raise ModelOutputError(f"纠错调用失败：{type(exc).__name__}", total) from exc
                 raise
-            total += _tokens(message)
-            text = _content(message)
             try:
                 data = schema.model_validate(_json_object(text))
                 parsed = data.model_dump()
@@ -191,14 +284,19 @@ class ModelBackend:
                 ]
         raise AssertionError("unreachable")
 
-    async def _text(self, system: str, user: str) -> CallResult:
-        message = await self.questioner.ainvoke(
-            [SystemMessage(content=system), HumanMessage(content=user)]
-        )
-        text = _tidy_line(_content(message))
+    async def _text(self, system: str, user: str, on_delta=None) -> CallResult:
+        messages = [SystemMessage(content=system), HumanMessage(content=user)]
+        if on_delta is None:
+            message = await self.questioner.ainvoke(messages)
+            text = _tidy_line(_content(message))
+            if not text:
+                raise ModelOutputError("模型返回空文本", _tokens(message))
+            return CallResult(text, _tokens(message))
+        buffer, total = await self._astream_text(self.questioner, messages, on_delta=on_delta)
+        text = _tidy_line(buffer)
         if not text:
-            raise ModelOutputError("模型返回空文本", _tokens(message))
-        return CallResult(text, _tokens(message))
+            raise ModelOutputError("模型返回空文本", total)
+        return CallResult(text, total)
 
     async def plan(self, options: dict) -> CallResult:
         count = options["num_questions"]
@@ -271,17 +369,23 @@ class ModelBackend:
             self.notify(f"虚实识别：{normalized} 个考点仅理论推测，已降难度至 ≤2、不占薄弱加权。")
         return CallResult(result.data["topics"], total)
 
-    async def question(self, topic: dict, index: int, total: int) -> CallResult:
+    async def question(self, topic: dict, index: int, total: int, *, on_delta=None) -> CallResult:
         user = (
             f"指定考点：{topic['topic']}\n难度：{topic['difficulty']}；证据：{topic['evidence']}\n"
             f"评价要点：{'；'.join(topic['points'])}\n请出本场第 {index}/{total} 题。"
         )
+        attempts = 0
 
         async def ask(extra=""):
+            nonlocal attempts
+            if on_delta is not None and attempts:
+                on_delta({"kind": "reset"})
+            attempts += 1
             return await self._structured(
                 self.questioner,
                 [SystemMessage(content=prompts.QUESTION), HumanMessage(content=user + extra)],
                 QuestionOutput,
+                on_delta=on_delta,
             )
 
         result = await ask()
@@ -340,7 +444,7 @@ class ModelBackend:
         result.data["score"] = max(0, min(100, result.data["score"]))
         return result
 
-    async def probe(self, question: dict, target: str, hop: int) -> CallResult:
+    async def probe(self, question: dict, target: str, hop: int, *, on_delta=None) -> CallResult:
         clarifying = question.get("rounds", [{}])[-1].get("decision", {}).get("action") == "CLARIFY"
         user = (
             f"原题：{question['text']}\n本轮目标：{target}\n\n完整问答：\n{rounds_digest(question)}"
@@ -353,7 +457,9 @@ class ModelBackend:
                 f"\n请给出第 {hop} 次正式追问；必要时先交代背景，只问一个点。"
             )
         return await self._text(
-            prompts.CLARIFY if clarifying else prompt_versions.PROBE[self.prompt_version], user
+            prompts.CLARIFY if clarifying else prompt_versions.PROBE[self.prompt_version],
+            user,
+            on_delta=on_delta,
         )
 
     async def closing(self, question: dict, reason: str, struggle: bool) -> CallResult:
@@ -422,6 +528,12 @@ class ModelBackend:
 class DemoBackend:
     """No network, no credentials, no real assessment. For interrupt/UI trials."""
 
+    @staticmethod
+    async def _demo_stream(text: str, on_delta, size: int = 6, delay: float = 0.03):
+        for i in range(0, len(text), size):
+            on_delta({"kind": "delta", "text": text[i : i + size]})
+            await asyncio.sleep(delay)
+
     async def plan(self, options: dict) -> CallResult:
         focus = options.get("focus") or ["流程演示"]
         return CallResult(
@@ -439,12 +551,15 @@ class DemoBackend:
             ]
         )
 
-    async def question(self, topic: dict, index: int, total: int) -> CallResult:
+    async def question(self, topic: dict, index: int, total: int, *, on_delta=None) -> CallResult:
+        text = f"【离线演示 {index}/{total}】围绕“{topic['topic']}”，你最近实践过的一个具体做法是什么？"
+        if on_delta is not None:
+            await self._demo_stream(text, on_delta)
         return CallResult(
             {
                 "topic": topic["topic"],
                 "difficulty": 2,
-                "text": f"【离线演示 {index}/{total}】围绕“{topic['topic']}”，你最近实践过的一个具体做法是什么？",
+                "text": text,
                 "reference_points": ["3分：描述具体做法", "5分：说明失败处理与验证"],
                 "probe_angles": ["失败处理", "验证方法", "替代方案"],
             }
@@ -464,13 +579,16 @@ class DemoBackend:
             }
         )
 
-    async def probe(self, question: dict, target: str, hop: int) -> CallResult:
+    async def probe(self, question: dict, target: str, hop: int, *, on_delta=None) -> CallResult:
         questions = [
             "如果这个做法失败了，你会先检查什么？",
             "你会用哪条测试验证刚才的判断？",
             "换一个业务场景，你会保留刚才做法的哪一部分？",
         ]
-        return CallResult("【离线演示】" + questions[(hop - 1) % len(questions)])
+        text = "【离线演示】" + questions[(hop - 1) % len(questions)]
+        if on_delta is not None:
+            await self._demo_stream(text, on_delta)
+        return CallResult(text)
 
     async def closing(self, question: dict, reason: str, struggle: bool) -> CallResult:
         return CallResult("【离线演示】本题问答结束，接下来汇总演示评分。")

@@ -38,7 +38,7 @@ class ScriptedBackend(FakeBackend):
         result.data = next(self.judgments)
         return result
 
-    async def probe(self, question, target, hop):
+    async def probe(self, question, target, hop, *, on_delta=None):
         result = await super().probe(question, target, hop)
         if question["rounds"][-1]["decision"]["action"] == "CLARIFY":
             result.data = "补充一个假设：持续十分钟。按这个条件，你会先排查什么？"

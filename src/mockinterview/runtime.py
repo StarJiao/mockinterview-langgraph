@@ -29,10 +29,11 @@ class Turn:
 
 
 class InterviewApp:
-    def __init__(self, data_dir, backend, notify=lambda _: None, stage_tracker=None):
+    def __init__(self, data_dir, backend, notify=lambda _: None, stage_tracker=None, emitter=None):
         self.data_dir = Path(data_dir)
         self.backend, self.notify = backend, notify
         self.stage_tracker = stage_tracker
+        self.emitter = emitter
         self._locks = {}
 
     async def __aenter__(self):
@@ -53,7 +54,8 @@ class InterviewApp:
             )
             self.stack.push_async_callback(self.jobs.close)
             self.nodes = Nodes(
-                self.backend, self.store, self.jobs, self.notify, recorder=self.recorder
+                self.backend, self.store, self.jobs, self.notify,
+                recorder=self.recorder, emitter=self.emitter,
             )
             self.graph = build_graph(self.nodes, self.checkpointer)
             return self

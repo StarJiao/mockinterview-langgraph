@@ -35,6 +35,29 @@ class FakeModel:
         )
 
 
+class StreamingFakeModel:
+    """Serves one streamed response per astream call, chunk by chunk."""
+
+    def __init__(self, responses):
+        self.responses = [list(response) for response in responses]
+        self.calls = []
+
+    async def astream(self, messages):
+        self.calls.append(messages)
+        if not self.responses:
+            raise AssertionError("unexpected stream call")
+        chunks = self.responses.pop(0)
+        last = len(chunks) - 1
+        for index, piece in enumerate(chunks):
+            if index == last:
+                yield AIMessage(
+                    content=piece,
+                    usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                )
+            else:
+                yield AIMessage(content=piece)
+
+
 async def test_prompt_versions_keep_original_and_change_only_selected_instructions():
     from mockinterview import prompts, prompt_versions
 
@@ -434,3 +457,89 @@ async def test_evaluation_persists_question_feedback():
     model = backend(evaluator=[{"dimensions": dimensions(), "feedback": feedback}])
     result = await model.evaluate(question())
     assert result.data["feedback"] == feedback
+
+
+def test_text_field_value_scanner_handles_escapes_and_partial_input():
+    from mockinterview.models import _text_field_value
+
+    assert _text_field_value('{"topic": "x", "difficulty": 3') is None
+    # 未闭合的转义与 \u 序列按字节等待，绝不提前上屏。
+    value, closed = _text_field_value('{"text": "a\\"b')
+    assert (value, closed) == ('a"b', False)
+    value, closed = _text_field_value('{"text": "a\\"b\\n问题", "topic"')
+    assert (value, closed) == ('a"b\n问题', True)
+    value, _ = _text_field_value('{"text": "ok\\u4e2')
+    assert value == 'ok'
+    value, _ = _text_field_value('{"text": "ok\\u4e2d"}')
+    assert value == 'ok中'
+
+
+async def test_question_streams_text_field_deltas_matching_final_text():
+    from types import SimpleNamespace
+
+    head = '{"text": "下游已经超时，你会先取消哪个请求？"'
+    tail = (
+        ', "topic": "Go 并发", "difficulty": 4,'
+        ' "reference_points": ["3分：说明超时", "5分：解释传播"], "probe_angles": ["取消传播"]}'
+    )
+    events = []
+    adapter = ModelBackend(
+        SimpleNamespace(evaluator_model="fake-judge"),
+        questioner=StreamingFakeModel([[head, tail]]),
+        evaluator=FakeModel([]),
+    )
+    result = await adapter.question(topic(), 1, 1, on_delta=events.append)
+    deltas = [event for event in events if event["kind"] == "delta"]
+    assert deltas, "streaming path must emit deltas"
+    assert "".join(event["text"] for event in deltas) == result.data["text"]
+    assert all(event["kind"] == "delta" for event in events)
+    # 流式结束块的 usage_metadata 必须进收据，token 记账不能因 astream 归零。
+    assert result.tokens == 10
+
+
+async def test_question_emits_reset_between_stream_attempts():
+    from types import SimpleNamespace
+
+    rejected = json.dumps(
+        {
+            "text": "请从A和B两方面详述取消语义",
+            "topic": "Go 并发",
+            "difficulty": 4,
+            "reference_points": ["x"],
+            "probe_angles": [],
+        },
+        ensure_ascii=False,
+    )
+    events = []
+    adapter = ModelBackend(
+        SimpleNamespace(evaluator_model="fake-judge"),
+        questioner=StreamingFakeModel([[rejected], [json.dumps(draft(), ensure_ascii=False)]]),
+        evaluator=FakeModel([]),
+    )
+    await adapter.question(topic(), 1, 1, on_delta=events.append)
+    # 题面不合格触发二次出题：重流之前必须先通知前端清空重来。
+    assert events.count({"kind": "reset"}) >= 1
+
+
+async def test_probe_streams_raw_text_deltas():
+    from types import SimpleNamespace
+
+    events = []
+    adapter = ModelBackend(
+        SimpleNamespace(evaluator_model="fake-judge"),
+        questioner=StreamingFakeModel([["嗯，", "你说取消等待", "具体怎么落？"]]),
+        evaluator=FakeModel([]),
+    )
+    result = await adapter.probe(question(), "取消传播", 1, on_delta=events.append)
+    assert "".join(event["text"] for event in events) == result.data
+
+
+async def test_demo_backend_stream_deltas_reconstruct_final_text():
+    demo = DemoBackend()
+    events = []
+    result = await demo.question(topic(), 1, 1, on_delta=events.append)
+    streamed = "".join(event["text"] for event in events if event["kind"] == "delta")
+    assert streamed == result.data["text"]
+    events.clear()
+    probe_result = await demo.probe(question(), "目标", 1, on_delta=events.append)
+    assert "".join(event["text"] for event in events if event["kind"] == "delta") == probe_result.data

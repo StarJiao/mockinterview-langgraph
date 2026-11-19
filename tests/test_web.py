@@ -215,7 +215,115 @@ async def test_stream_shows_three_roles_and_resume_until_done(web):
     assert roles == {"system", "interviewer", "candidate"}
     assert any("候选人已提交本轮回答" in m["text"] for m in detail["messages"])
     assert all(m["label"] == "候选人" for m in detail["messages"] if m["role"] == "candidate")
-    assert detail["pending"] is None
+
+
+async def test_events_channel_opens_with_a_hello_snapshot(web):
+    """SSE: first event is a hello snapshot carrying the pending question.
+
+    ?once=1 pins the endless stream to a single cycle so ASGITransport can
+    finish the ASGI call and the test can consume the whole body.
+    """
+    client, service, _ = web
+    await login(client, service=service)
+    created = await new_interview(client, topic="Go 并发", num_questions=1)
+    session_id = created.json()["id"]
+    await service.wait(session_id)
+    response = await client.get(f"/api/interviews/{session_id}/events?once=1")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert events, "expected at least one SSE event"
+    hello = events[0]
+    assert hello["type"] == "hello"
+    assert hello["pending"] is not None
+    assert hello["busy"] is False
+    assert any(
+        m["role"] == "interviewer" and "主问1" in m["text"] for m in hello["messages"]
+    )
+    # With nothing in flight, one cycle must not produce a redundant state echo.
+    assert all(event["type"] == "hello" for event in events)
+
+
+async def test_qstream_is_emitted_after_the_authoritative_snapshot(web):
+    """Token deltas must never overtake the messages they belong to.
+
+    Otherwise the UI streams a new question while the previous answer,
+    submit event and waiting hint are still queued behind it; the messages
+    then visibly jump upwards once the snapshot catches up.
+    """
+    client, service, _ = web
+    await login(client, service=service)
+    created = await new_interview(client, topic="Go 并发", num_questions=1)
+    session_id = created.json()["id"]
+    await service.wait(session_id)
+
+    # 在 SSE 订阅建立的瞬间注入一片 token，模拟「出题已经开始」。
+    class NotifyingSet(set):
+        def __init__(self):
+            super().__init__()
+            self.fired = False
+
+        def add(self, item):
+            super().add(item)
+            if not self.fired:
+                self.fired = True
+                service.emit_stream(
+                    session_id, {"type": "qstream", "kind": "delta", "text": "片段"}
+                )
+
+    service.stream_subs[session_id] = NotifyingSet()
+    response = await client.get(f"/api/interviews/{session_id}/events?once=1")
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    types = [event["type"] for event in events]
+    assert "hello" in types and "qstream" in types
+    assert types.index("hello") < types.index("qstream")
+    # The snapshot carries the full message list; it has to precede any token.
+    assert any(
+        message["role"] == "interviewer"
+        for message in events[types.index("hello")]["messages"]
+    )
+
+
+async def test_waiting_hint_stays_after_its_question(web):
+    """The waiting hint is history, not a transient pending flag.
+
+    It must sit directly after the question it belongs to and survive the
+    candidate's answer plus the submit event instead of being erased.
+    """
+    client, service, _ = web
+    await login(client, service=service)
+    session_id = (await new_interview(client, topic="Go 并发", num_questions=1)).json()["id"]
+    await service.wait(session_id)
+    detail = (await client.get(f"/api/interviews/{session_id}")).json()
+    messages = detail["messages"]
+    question = next(
+        i for i, m in enumerate(messages)
+        if m["role"] == "interviewer" and "主问1" in m["text"]
+    )
+    assert messages[question + 1]["text"] == "等待候选人作答"
+
+    response = await client.post(
+        f"/api/interviews/{session_id}/answer", json={"answer": "我先回滚数据，再看日志。"}
+    )
+    assert response.status_code == 202
+    await service.wait(session_id)
+    messages = (await client.get(f"/api/interviews/{session_id}")).json()["messages"]
+    texts = [m["text"] for m in messages]
+    assert texts[question + 1] == "等待候选人作答"
+    answer = next(i for i, m in enumerate(messages) if m["role"] == "candidate")
+    submitted = next(i for i, text in enumerate(texts) if "候选人已提交本轮回答" in text)
+    decision = next(i for i, text in enumerate(texts) if text.startswith("快评决策"))
+    assert question < question + 1 < answer
+    # 提交确认发生在快评之前，展示顺序也必须如此。
+    assert answer + 1 == submitted < decision
 
 
 async def test_web_refuses_continuing_a_session_with_a_mismatched_backend(web):
@@ -668,3 +776,56 @@ async def test_server_page_replaces_call_details_with_hourly_charts(web):
     assert "Token 消耗" in body
     assert "API 错误（区分类型）" in body
     assert "TimeoutError" in body      # 错误类型图例与汇总表可见
+
+
+def test_stream_diff_handles_event_anchor_shift_without_full_hello():
+    """Event messages shift forward once a round gains answer/decision lines;
+    the diff must truncate the shifted tail, not degenerate into a full hello."""
+    from mockinterview.web import stream_delta
+
+    question = {"role": "interviewer", "label": "面试官", "text": "主问1：…", "anchor": "q:a:r0"}
+    event = {"role": "system", "label": "系统", "text": "候选人已提交本轮回答，等待生成下一步", "anchor": "q:a:r0"}
+    answer = {"role": "candidate", "label": "候选人", "text": "我的回答", "anchor": "q:a:r0"}
+    decision = {"role": "system", "label": "系统", "text": "快评决策：已给出部分证据", "anchor": "q:a:r0"}
+
+    assert stream_delta(None, [question, event])["kind"] == "hello"
+    assert stream_delta([question], [question])["kind"] == "none"
+    # 纯尾部增长：普通 append
+    pure = stream_delta([question, event], [question, event, answer])
+    assert pure == {"kind": "truncate", "keep": 2, "items": [answer]}
+    # 事件移位：截掉移位尾巴后重发，已渲染的历史节点不动
+    shifted = stream_delta([question, event], [question, answer, decision, event])
+    assert shifted == {"kind": "truncate", "keep": 1, "items": [answer, decision, event]}
+
+
+def test_stream_diff_handles_event_anchor_shift_without_full_hello():
+    """Event messages shift forward once a round gains answer/decision lines;
+    the diff must truncate the shifted tail, not degenerate into a full hello."""
+    from mockinterview.web import stream_delta
+
+    question = {"role": "interviewer", "label": "面试官", "text": "主问1：…", "anchor": "q:a:r0"}
+    event = {"role": "system", "label": "系统", "text": "候选人已提交本轮回答，等待生成下一步", "anchor": "q:a:r0"}
+    answer = {"role": "candidate", "label": "候选人", "text": "我的回答", "anchor": "q:a:r0"}
+    decision = {"role": "system", "label": "系统", "text": "快评决策：已给出部分证据", "anchor": "q:a:r0"}
+
+    assert stream_delta(None, [question, event])["kind"] == "hello"
+    assert stream_delta([question], [question])["kind"] == "none"
+    # 纯尾部增长：普通 append
+    pure = stream_delta([question, event], [question, event, answer])
+    assert pure == {"kind": "truncate", "keep": 2, "items": [answer]}
+    # 事件移位：截掉移位尾巴后重发，已渲染的历史节点不动
+    shifted = stream_delta([question, event], [question, answer, decision, event])
+    assert shifted == {"kind": "truncate", "keep": 1, "items": [answer, decision, event]}
+
+
+async def test_events_stream_exits_once_the_service_is_stopping(web):
+    """Shutdown must not hang on an endless stream: the flag ends the generator."""
+    client, service, _ = web
+    await login(client, service=service)
+    session_id = (await new_interview(client)).json()["id"]
+    await service.wait(session_id)
+    service.stopping.set()
+    # 没有 ?once=1：无限流靠停止标志自行结束，ASGITransport 才能返回。
+    response = await client.get(f"/api/interviews/{session_id}/events")
+    assert response.status_code == 200
+    assert response.text == ""

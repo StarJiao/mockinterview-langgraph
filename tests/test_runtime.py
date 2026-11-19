@@ -52,7 +52,7 @@ class FakeBackend:
         ]
         return CallResult(topics, self.plan_tokens)
 
-    async def question(self, topic, index, total):
+    async def question(self, topic, index, total, *, on_delta=None):
         self.calls["question"] += 1
         return CallResult(
             {
@@ -82,7 +82,7 @@ class FakeBackend:
             3,
         )
 
-    async def probe(self, question, target, hop):
+    async def probe(self, question, target, hop, *, on_delta=None):
         self.calls["probe"] += 1
         self.probe_inputs.append((deepcopy(question), target, hop))
         if self.fail_probe_once:
@@ -397,7 +397,7 @@ async def test_failed_model_usage_is_durable_and_not_counted_twice(tmp_path):
     from mockinterview.models import ModelOutputError
 
     class InvalidOnce(FakeBackend):
-        async def probe(self, question, target, hop):
+        async def probe(self, question, target, hop, *, on_delta=None):
             if self.calls["probe"] == 0:
                 self.calls["probe"] += 1
                 raise ModelOutputError("输出无效", tokens=17)
@@ -465,3 +465,31 @@ async def test_stage_metrics_are_written_by_cli_runtime_and_record_failures(tmp_
         assert summary["calls"] == 1
         assert summary["total_tokens"] == 99
         assert summary["failures"] == 1
+
+
+async def test_stream_events_reach_the_emitter(tmp_path):
+    """Question/probe token deltas flow to the Web emitter as qstream events."""
+    from mockinterview.models import DemoBackend
+
+    events = []
+    app = InterviewApp(
+        tmp_path,
+        DemoBackend(),
+        notify=lambda _: None,
+        emitter=lambda session_id, event: events.append((session_id, event)),
+    )
+    async with app:
+        await app.start(options(), "stream-demo")
+        await app.resume("stream-demo", "我会先按请求参数做合并去重")
+    session_events = [event for session_id, event in events if session_id == "stream-demo"]
+    question_events = [event for event in session_events if event["type"] == "qstream"]
+    deltas = [event for event in question_events if event["kind"] == "delta"]
+    assert deltas, "question deltas must reach the emitter"
+    # 分隔线必须在第一片题面 token 之前发出：否则浏览器会先流式出题、
+    # 再在定稿批次里把「第 N 题」分隔线闪出来。
+    opens = [event for event in session_events if event["type"] == "qopen"]
+    assert opens, "question divider open must reach the emitter"
+    assert session_events.index(opens[0]) < session_events.index(deltas[0])
+    assert opens[0]["index"] == 1 and opens[0]["topic"]
+    # 主问与追问两条流各自拼回原文：DemoBackend 的分片发射与最终文本一致。
+    assert all(event["kind"] in {"delta", "reset"} for event in question_events)
