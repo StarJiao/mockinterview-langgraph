@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
+import unicodedata
 from uuid import uuid4
 
 from prompt_toolkit import PromptSession
@@ -29,6 +30,30 @@ def colors_enabled(stream=None, environ=None) -> bool:
     stream = sys.stdout if stream is None else stream
     environ = os.environ if environ is None else environ
     return bool(stream.isatty() and "NO_COLOR" not in environ and environ.get("TERM") != "dumb")
+
+
+def display_width(text: str) -> int:
+    """Terminal columns used by text: CJK wide glyphs occupy two columns, the rest one."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def render_table(headers, rows, align_right=()) -> str:
+    """Plain-text table aligned by display width, so mixed CJK/ASCII columns line up."""
+    widths = [
+        max(display_width(cell) for cell in [header] + [row[index] for row in rows])
+        for index, header in enumerate(headers)
+    ]
+
+    def line(cells) -> str:
+        parts = []
+        for index, cell in enumerate(cells):
+            gap = " " * (widths[index] - display_width(cell))
+            parts.append(gap + cell if index in align_right else cell + gap)
+        return "  ".join(parts).rstrip()
+
+    body = [line(list(headers)), line(["-" * width for width in widths])]
+    body.extend(line(list(row)) for row in rows)
+    return "\n".join(body)
 
 
 class Console:
@@ -312,24 +337,41 @@ async def pass_command(args, console: Console) -> int:
             return 0
         if args.pass_command == "list":
             rows = await store.list_passes()
-            console.system("id\t类型\t令牌\t用量/配额\t有效期至\t状态\t备注")
+            if not rows:
+                console.system("还没有任何令牌；用 pass new 签发。")
+                return 0
             now_iso = datetime.now(timezone.utc).isoformat()
+            table = []
             for row in rows:
                 quota = row["quota_tokens"]
                 usage = f"{row['used_tokens']}/{quota if quota is not None else '∞'}"
                 if row["revoked"]:
                     state = "已作废"
                 elif row["kind"] == "temp" and row["first_used_at"] is None:
-                    state = "未激活（首次使用起计时）"
+                    state = "未激活"
                 elif row["expires_at"] <= now_iso:
                     state = "已过期"
                 else:
                     state = "有效"
-                token = row["token"] or "（旧令牌仅存哈希，无法显示）"
-                print(
-                    f"{row['id']}\t{row['kind']}\t{token}\t{usage}\t"
-                    f"{row['expires_at'][:19].replace('T', ' ')}\t{state}\t{row['label']}"
+                table.append(
+                    [
+                        str(row["id"]),
+                        "长期" if row["kind"] == "long" else "临时",
+                        row["token"] or "（旧令牌仅存哈希）",
+                        usage,
+                        row["expires_at"][:19].replace("T", " "),
+                        state,
+                        row["label"] or "",
+                    ]
                 )
+            print(
+                render_table(
+                    ["id", "类型", "令牌", "用量/配额", "有效期至", "状态", "备注"],
+                    table,
+                    align_right=(0,),
+                ),
+                flush=True,
+            )
             return 0
         # revoke
         if not await store.revoke_pass(args.pass_id):

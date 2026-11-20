@@ -353,6 +353,8 @@ class WebService:
 
     async def launch(self, session_id: str, factory):
         async with self._guard:
+            if await self.store.owner(session_id) is None:
+                raise HTTPException(status_code=404, detail="会话不存在或已删除")
             if self.busy(session_id):
                 raise HTTPException(status_code=409, detail="这场面试正在处理上一轮，请稍候")
             self.tasks[session_id] = asyncio.create_task(self._run(session_id, factory))
@@ -402,6 +404,8 @@ def service_of(request: Request) -> WebService:
 
 
 async def current_user(request: Request, service: WebService = Depends(service_of)) -> str:
+    if getattr(request.state, "read_only", False):
+        return "guest"
     raw = request.cookies.get(COOKIE)
     if not raw:
         raise HTTPException(status_code=401, detail="请先填写用户名登录")
@@ -462,6 +466,8 @@ def pass_info(pass_row: dict, used_tokens: int | None = None) -> dict:
 
 async def require_write_quota(pass_row: dict, service: WebService) -> None:
     """Temp passes need quota headroom for anything that calls the models."""
+    if pass_row is None:
+        raise HTTPException(status_code=403, detail="只读身份无法修改会话，请联系作者获取访问令牌")
     if pass_row["kind"] != "temp" or pass_row["quota_tokens"] is None:
         return
     used = await service.store.pass_usage(pass_row["id"])
@@ -590,14 +596,20 @@ def create_app(service: WebService) -> FastAPI:
         if path.startswith("/api/") and path != "/api/login":
             raw = request.cookies.get(PASS_COOKIE)
             pass_row = await fetch_pass(raw, service)
-            if not pass_is_valid(pass_row):
+            read_only = not raw and request.cookies.get(COOKIE) == "guest"
+            if not pass_is_valid(pass_row) and not read_only and path != "/api/logout":
                 detail = (
                     "访问令牌无效或已过期，请联系作者重新获取"
                     if raw
                     else "需要访问令牌：请通过带 ?pass= 的链接进入，或在登录框填入令牌"
                 )
                 return JSONResponse({"detail": detail}, status_code=401)
+            if read_only and request.method not in {"GET", "HEAD"} and path != "/api/logout":
+                return JSONResponse(
+                    {"detail": "只读身份无法修改会话，请联系作者获取访问令牌"}, status_code=403
+                )
             request.state.pass_row = pass_row
+            request.state.read_only = read_only
         return await call_next(request)
 
     @app.get("/")
@@ -635,13 +647,23 @@ def create_app(service: WebService) -> FastAPI:
                 detail="用户名需为 1–32 个中英文、数字、空格、点或连字符，且不能以符号开头",
             )
         token = body.pass_token.strip()
+        if username == "guest" and not token:
+            await service.store.ensure_user("guest")
+            response = JSONResponse({"username": "guest", "read_only": True})
+            response.set_cookie(
+                COOKIE, "guest", httponly=True, samesite="lax", path="/",
+                secure=service.secure_cookies,
+            )
+            # An explicit read-only login also downgrades an existing writable session.
+            response.delete_cookie(PASS_COOKIE, path="/")
+            return response
         pass_row = await fetch_pass(token, service)
         if not pass_is_valid(pass_row):
             raise HTTPException(
                 status_code=401, detail="令牌无效或已过期，请联系作者重新获取"
             )
         await service.store.ensure_user(username)
-        response = JSONResponse({"username": username})
+        response = JSONResponse({"username": username, "read_only": False})
         response.set_cookie(
             COOKIE, quote(username, safe=""), httponly=True, samesite="lax", path="/",
             secure=service.secure_cookies,
@@ -688,12 +710,14 @@ def create_app(service: WebService) -> FastAPI:
         service: WebService = Depends(service_of),
     ):
         pass_row = request.state.pass_row
+        if request.state.read_only:
+            return {"username": "guest", "pass": None, "read_only": True}
         used = (
             await service.store.pass_usage(pass_row["id"])
             if pass_row["kind"] == "temp"
             else None
         )
-        return {"username": username, "pass": pass_info(pass_row, used)}
+        return {"username": username, "pass": pass_info(pass_row, used), "read_only": False}
 
     @app.get("/api/interviews")
     async def list_interviews(
@@ -745,6 +769,20 @@ def create_app(service: WebService) -> FastAPI:
             ),
         )
         return {"id": session_id, "busy": True}
+
+    @app.delete("/api/interviews/{session_id}")
+    async def delete_interview(
+        session_id: str,
+        username: str = Depends(current_user),
+        service: WebService = Depends(service_of),
+    ):
+        async with service._guard:
+            await require_owned(session_id, username, service)
+            if service.busy(session_id) or service.scoring_pending(session_id):
+                raise HTTPException(status_code=409, detail="会话正在生成内容或评分，请结束后再删除")
+            if not await service.store.soft_delete_session(session_id, username):
+                raise HTTPException(status_code=404, detail="会话不存在或已删除")
+        return {"id": session_id, "deleted": True}
 
     @app.get("/api/interviews/{session_id}")
     async def detail(
@@ -840,6 +878,9 @@ def create_app(service: WebService) -> FastAPI:
             try:
                 while True:
                     if service.stopping.is_set() or await request.is_disconnected():
+                        return
+                    if await service.store.owner(session_id) != username:
+                        yield sse({"type": "deleted", "id": session_id})
                         return
                     # 先把权威消息同步到客户端：候选人回答、提交事件、等待提示
                     # 的清除都必须在下一道题开流之前完成。之前反过来冲刷，

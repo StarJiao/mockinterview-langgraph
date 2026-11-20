@@ -106,6 +106,8 @@ class OperationStore:
             await self.conn.execute(
                 "ALTER TABLE sessions ADD COLUMN username TEXT NOT NULL DEFAULT ''"
             )
+        if "deleted_at" not in columns:
+            await self.conn.execute("ALTER TABLE sessions ADD COLUMN deleted_at TEXT")
         await self.conn.execute(
             "UPDATE sessions SET username=? WHERE username='' OR username IS NULL",
             (CLI_USER,),
@@ -139,19 +141,32 @@ class OperationStore:
 
     async def list_sessions(self, username: str | None = None) -> list[tuple[str, str]]:
         if username is None:
-            query, params = "SELECT id, created_at FROM sessions ORDER BY created_at DESC", ()
+            query, params = (
+                "SELECT id, created_at FROM sessions WHERE deleted_at IS NULL "
+                "ORDER BY created_at DESC", ()
+            )
         else:
-            query = "SELECT id, created_at FROM sessions WHERE username=? ORDER BY created_at DESC"
+            query = ("SELECT id, created_at FROM sessions WHERE username=? "
+                     "AND deleted_at IS NULL ORDER BY created_at DESC")
             params = (username,)
         async with self.conn.execute(query, params) as cur:
             return await cur.fetchall()
 
     async def owner(self, session_id: str) -> str | None:
         async with self.conn.execute(
-            "SELECT username FROM sessions WHERE id=?", (session_id,)
+            "SELECT username FROM sessions WHERE id=? AND deleted_at IS NULL", (session_id,)
         ) as cur:
             row = await cur.fetchone()
         return row[0] if row else None
+
+    async def soft_delete_session(self, session_id: str, username: str) -> bool:
+        async with self.conn.execute(
+            "UPDATE sessions SET deleted_at=? WHERE id=? AND username=? AND deleted_at IS NULL",
+            (datetime.now(timezone.utc).isoformat(), session_id, username),
+        ) as cur:
+            changed = cur.rowcount == 1
+        await self.conn.commit()
+        return changed
 
     async def ensure_user(self, username: str) -> None:
         """Register a Web username; ownership is set when a session is created.
