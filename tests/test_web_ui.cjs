@@ -5,7 +5,10 @@ const vm = require('node:vm');
 const { parseHTML } = require('linkedom');
 
 function app() {
-  const { document } = parseHTML('<html><body><button id="clean-toggle"></button><div id="content"></div><div id="session-list"></div></body></html>');
+  const { document } = parseHTML(fs.readFileSync('src/mockinterview/web_static/index.html', 'utf8'));
+  const dialog = document.querySelector('#delete-dialog');
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
   const timers = new Map();
   let sequence = 0;
   const context = vm.createContext({ document, window: { innerHeight: 800, scrollY: 0, scrollTo() {}, matchMedia: () => ({ matches: false }) },
@@ -156,4 +159,64 @@ test('reduced motion shows the waiting hint immediately after the complete quest
   append(a,[msg('interviewer','完整题目'),msg('system','等待候选人作答','q:1:r0:wait')]);
   assert.equal(a.document.querySelector('.interviewer .msg-body').textContent,'完整题目');
   assert(!a.document.querySelector('.system').hidden);
+});
+
+test('readonly guest sees examples and reports without write controls', () => {
+  const a = app();
+  a.run("state.readOnly=true; state.sessions=[{id:'test',topic:'示例',num_questions:2}]; syncAccessControls(); renderSessions(); render()");
+  assert(a.document.querySelector('#new-btn').hidden);
+  assert(!a.document.querySelector('#readonly-intro').hidden);
+  assert.equal(a.document.querySelector('#session-title').textContent,'示例面试');
+  assert.equal(a.document.querySelector('[data-delete-session]'),null);
+  assert.equal(a.document.querySelector('#answer-input'),null);
+  a.run('state.detail.pending=null; renderBottom()');
+  assert.equal(a.document.querySelector('[data-action="resume"]'),null);
+  a.run("state.detail.done=true; state.reportFor=state.current; state.reportHtml='示例报告'; renderBottom()");
+  assert.equal(a.document.querySelector('#report-body').textContent,'示例报告');
+  a.run('state.readOnly=false; state.detail.done=false; state.detail.pending={ask:"问题"}; syncAccessControls(); renderSessions(); renderBottom()');
+  assert(!a.document.querySelector('#new-btn').hidden);
+  assert(a.document.querySelector('[data-delete-session]'));
+  assert(a.document.querySelector('#answer-input'));
+});
+
+test('guest entry ignores typed credentials and sends only tokenless guest login', async () => {
+  const a=app();
+  a.document.querySelector('#username').value='alice';
+  a.document.querySelector('#pass-input').value='valid-token';
+  a.run("globalThis.calls=[]; api=async(path,options)=>{calls.push({path,options}); return path==='/api/me'?{username:'guest',pass:null,read_only:true}:{username:'guest',read_only:true}}; showMain=async()=>{}");
+  await a.run('enterSession(true)');
+  assert.deepEqual(JSON.parse(a.run('calls[0].options.body')),{username:'guest',pass_token:''});
+  assert.equal(a.run('state.readOnly'),true);
+  assert.equal(a.run('state.user'),'guest');
+});
+
+test('deleting requires confirmation and removes only the chosen session', async () => {
+  const a=app();
+  a.run("state.user='alice';state.sessions=[{id:'test',topic:'当前面试'},{id:'other',topic:'另一场'}];globalThis.calls=[];api=async(path,options)=>{calls.push({path,options});return {deleted:true}};renderSessions()");
+  const draft=a.document.querySelector('#answer-input');draft.value='保留的草稿';
+  a.run("requestDeleteSession('other')");
+  assert.equal(a.run('calls.length'),0);
+  assert(a.document.querySelector('#delete-dialog').open);
+  assert(a.document.querySelector('#delete-description').textContent.includes('另一场'));
+  await a.run('confirmDeleteSession()');
+  assert.equal(a.run('calls[0].options.method'),'DELETE');
+  assert.equal(a.run('state.sessions.length'),1);
+  assert.equal(a.run('state.current'),'test');
+  assert.equal(a.document.querySelector('#answer-input').value,'保留的草稿');
+  a.run("requestDeleteSession('test')");await a.run('confirmDeleteSession()');
+  assert.equal(a.run('state.current'),null);
+  assert.equal(a.run('state.view'),'empty');
+  assert.equal(a.document.querySelector('#answer-input'),null);
+});
+
+test('failed deletion retains the session and shows the error; readonly cannot delete', async () => {
+  const a=app();
+  a.run("state.sessions=[{id:'test',topic:'面试'}];api=async()=>{throw new Error('正在评分，请稍后删除')};requestDeleteSession('test')");
+  await a.run('confirmDeleteSession()');
+  assert.equal(a.run('state.sessions.length'),1);
+  assert(a.document.querySelector('#delete-dialog').open);
+  assert(!a.document.querySelector('#delete-error').hidden);
+  assert(a.document.querySelector('#delete-error').textContent.includes('正在评分'));
+  a.run("state.readOnly=true;state.deleteTarget=null;requestDeleteSession('test')");
+  assert.equal(a.run('state.deleteTarget'),null);
 });

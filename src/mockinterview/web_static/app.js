@@ -35,6 +35,10 @@ function syncCleanToggle() {
 const state = {
   user: null,
   pass: null,
+  readOnly: false,
+  authVersion: 0,
+  deleteTarget: null,
+  deleting: false,
   topics: [],
   sessions: [],
   current: null,
@@ -223,23 +227,27 @@ function renderMetrics(detail) {
 
 function renderSessions() {
   if (!state.sessions.length) {
-    sessionList.innerHTML = '<div class="empty-list">还没有面试记录，点上方按钮新建一场。</div>';
+    sessionList.innerHTML = `<div class="empty-list">${state.readOnly ? '作者暂未添加示例面试，稍后再来看看。' : '还没有面试记录，点上方按钮新建一场。'}</div>`;
     return;
   }
   sessionList.innerHTML = state.sessions.map((item) => {
     const done = item.status === 'done';
     const badge = done ? '已完成' : '进行中';
     const progress = `${item.completed}/${item.num_questions || '—'}`;
-    return `<button class="session-item ${state.current === item.id && state.view === 'detail' ? 'active' : ''}"
+    const when = String(item.updated_at || '').slice(5, 16).replace('T', ' ');
+    return `<div class="session-row"><button class="session-item ${state.current === item.id && state.view === 'detail' ? 'active' : ''}"
       data-session="${escapeHtml(item.id)}" type="button">
       <span class="topic">${escapeHtml(item.topic || '未命名面试')}</span>
-      <span class="sub"><span>${progress} 题 · ${escapeHtml(String(item.updated_at || '').slice(0, 16))}</span>
-      <span class="badge ${done ? 'done' : 'running'}">${badge}</span></span>
-    </button>`;
+      <span class="sub"><span class="badge ${done ? 'done' : 'running'}">${badge}</span>
+      <span class="meta">${progress} 题 · ${escapeHtml(when)}</span></span>
+    </button>${state.readOnly ? '' : `<button class="delete-session" type="button" data-delete-session="${escapeHtml(item.id)}" aria-label="删除面试：${escapeHtml(item.topic || '未命名面试')}">删除</button>`}</div>`;
   }).join('');
 }
 
 function renderEmpty() {
+  if (state.readOnly) return `<div class="card"><h2>浏览示例面试</h2>
+    <p class="card-sub">从左侧选择一场面试，查看问答过程、追问和评分报告。</p>
+    ${notice('当前为只读 guest 身份。新建面试或亲自作答，需要线下联系作者获取访问令牌。')}</div>`;
   return `<div class="card">
     <h2>开始一场模拟面试</h2>
     <p class="card-sub">逐题出题、动态追问、异步单题评分，最后生成 Markdown 报告。</p>
@@ -650,7 +658,7 @@ function bottomSignature() {
   return JSON.stringify([
     Boolean(detail.done), state.submitting, Boolean(detail.busy),
     Boolean(detail.pending), detail.pending ? detail.pending.ask : '',
-    state.cleanMode, state.error, state.emptyConfirm, detail.scoring_pending ? 1 : 0,
+    state.cleanMode, state.readOnly, state.error, state.emptyConfirm, detail.scoring_pending ? 1 : 0,
     `${session.completed || 0}/${session.num_questions || 0}`,
   ]);
 }
@@ -677,6 +685,10 @@ function renderBottom() {
         <div class="report" id="report-body">${state.reportFor === state.current
           ? state.reportHtml : '<div class="loading">正在读取报告…</div>'}</div>
       </div>`;
+  } else if (state.readOnly) {
+    html = notice(detail.busy || detail.scoring_pending
+      ? '这场示例面试正在更新，内容会自动显示。当前为只读身份。'
+      : '当前为只读身份，可查看对话。想亲自作答，请联系作者获取访问令牌。');
   } else if (state.submitting && lastDone) {
     html = scoringCardHtml();
   } else if (detail.scoring_pending && !detail.pending && !detail.busy) {
@@ -785,6 +797,10 @@ function subscribe(sessionId) {
     else if (payload.type === 'state') applyState(payload);
     else if (payload.type === 'qstream') applyQStream(payload);
     else if (payload.type === 'qopen') applyQOpen(payload);
+    else if (payload.type === 'deleted') {
+      forgetSession(sessionId);
+      loadSessions();
+    }
   };
   es.onerror = () => {
     // 只有连接彻底关闭（例如令牌失效返回 401）才回登录页；
@@ -889,11 +905,14 @@ function applyState(payload) {
 }
 
 async function loadSessions() {
+  const authVersion = state.authVersion;
   try {
     const result = await api('/api/interviews');
+    if (authVersion !== state.authVersion) return;
     state.sessions = result.sessions || [];
     renderSessions();
   } catch (error) {
+    if (authVersion !== state.authVersion) return;
     state.error = error.message;
   }
 }
@@ -944,6 +963,7 @@ async function openSession(id) {
 }
 
 function passStatusText(info) {
+  if (state.readOnly) return '只读浏览';
   if (!info) return '';
   if (info.kind !== 'temp') return '长期令牌 · 不限配额';
   const remaining = Math.max(
@@ -962,9 +982,15 @@ function passStatusText(info) {
 async function updatePassStatus() {
   // Balance comes from stage_metrics sums, so it moves as the interview burns
   // tokens; refresh it whenever the detail view catches a revision change.
+  const authVersion = state.authVersion;
   try {
     const me = await api('/api/me');
+    if (authVersion !== state.authVersion) return;
     state.pass = me.pass;
+    const changed = state.readOnly !== Boolean(me.read_only);
+    state.readOnly = Boolean(me.read_only);
+    syncAccessControls();
+    if (changed) { renderSessions(); render(); }
     const node = $('#pass-status');
     if (node) node.textContent = passStatusText(state.pass);
   } catch (_) {
@@ -973,9 +999,17 @@ async function updatePassStatus() {
 }
 
 async function showMain() {
+  // Clear the previous user's content before revealing a newly logged-in session.
+  state.sessions = [];
+  state.current = null;
+  state.detail = null;
+  state.view = 'empty';
+  renderSessions();
+  render();
   $('#login-view').hidden = true;
   $('#main-view').hidden = false;
   $('#who').textContent = state.user;
+  syncAccessControls();
   $('#pass-status').textContent = passStatusText(state.pass);
   updatePassStatus();
   await loadTopics();
@@ -984,35 +1018,133 @@ async function showMain() {
 }
 
 function showLogin() {
+  state.authVersion++;
   $('#main-view').hidden = true;
   $('#login-view').hidden = false;
   if (state.es) { state.es.close(); state.es = null; }
+  removeOptimisticNodes();
+  for (const entry of state.streamRendered) clearTimeout(entry.node?.typingTimer);
+  state.streamRendered = [];
+  state.streamSession = null;
+  state.detail = null;
+  state.sessions = [];
   state.user = null;
   state.pass = null;
+  state.readOnly = false;
+  state.deleteTarget = null;
+  $('#delete-dialog')?.close();
   state.current = null;
   state.view = 'empty';
 }
 
-$('#login-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
+function syncAccessControls() {
+  if ($('#new-btn')) $('#new-btn').hidden = state.readOnly;
+  if ($('#readonly-intro')) $('#readonly-intro').hidden = !state.readOnly;
+  if ($('#session-title')) $('#session-title').textContent = state.readOnly ? '示例面试' : '我的面试';
+}
+
+function forgetSession(id) {
+  state.sessions = state.sessions.filter(item => item.id !== id);
+  if (state.current === id) {
+    if (state.es) { state.es.close(); state.es = null; }
+    removeOptimisticNodes();
+    for (const entry of state.streamRendered) clearTimeout(entry.node?.typingTimer);
+    state.current = null;
+    state.detail = null;
+    state.streamRendered = [];
+    state.streamSession = null;
+    state.reportFor = null;
+    state.reportHtml = '';
+    state.view = 'empty';
+    state.error = '';
+    render();
+  }
+  renderSessions();
+}
+
+function requestDeleteSession(id) {
+  if (state.readOnly || state.deleting) return;
+  const item = state.sessions.find(item => item.id === id);
+  if (!item) return;
+  state.deleteTarget = id;
+  $('#delete-description').textContent = `${item.topic || '未命名面试'} · ${item.num_questions || '—'} 题 · ${formatTime(item.updated_at)}`;
+  $('#delete-error').hidden = true;
+  $('#delete-dialog').showModal();
+}
+
+async function confirmDeleteSession() {
+  if (state.readOnly || state.deleting || !state.deleteTarget) return;
+  const id = state.deleteTarget;
+  const user = state.user;
+  state.deleting = true;
+  $('#confirm-delete').disabled = true;
+  $('#cancel-delete').disabled = true;
+  try {
+    await api(`/api/interviews/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (state.user !== user) return;
+    $('#delete-dialog').close();
+    state.deleteTarget = null;
+    forgetSession(id);
+  } catch (error) {
+    if (state.user !== user) return;
+    $('#delete-error').textContent = error.message;
+    $('#delete-error').hidden = false;
+  } finally {
+    state.deleting = false;
+    $('#confirm-delete').disabled = false;
+    $('#cancel-delete').disabled = false;
+  }
+}
+
+async function enterSession(readOnly = false) {
+  const authVersion = ++state.authVersion;
   const box = $('#login-error');
   box.hidden = true;
+  const buttons = document.querySelectorAll('#login-form button');
+  buttons.forEach(button => { button.disabled = true; });
   try {
     const result = await api('/api/login', {
       method: 'POST',
       body: JSON.stringify({
-        username: $('#username').value,
-        pass_token: $('#pass-input').value,
+        username: readOnly ? 'guest' : $('#username').value,
+        pass_token: readOnly ? '' : $('#pass-input').value,
       }),
     });
+    if (authVersion !== state.authVersion) return;
     state.user = result.username;
     const me = await api('/api/me');
+    if (authVersion !== state.authVersion) return;
     state.pass = me.pass;
+    state.readOnly = Boolean(me.read_only);
     await showMain();
   } catch (error) {
     box.textContent = error.message;
     box.hidden = false;
+  } finally {
+    buttons.forEach(button => { button.disabled = false; });
   }
+}
+
+$('#login-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  await enterSession(false);
+});
+
+$('#guest-login')?.addEventListener('click', () => enterSession(true));
+$('#token-login')?.addEventListener('click', async () => {
+  await api('/api/logout', { method: 'POST' }).catch(() => null);
+  showLogin();
+  $('#username').value = 'guest';
+  $('#pass-input').focus();
+});
+$('#confirm-delete')?.addEventListener('click', confirmDeleteSession);
+$('#cancel-delete')?.addEventListener('click', () => {
+  state.deleteTarget = null;
+  $('#delete-dialog').close();
+});
+$('#delete-dialog')?.addEventListener('cancel', event => {
+  if (state.deleting) event.preventDefault();
+  else state.deleteTarget = null;
 });
 
 window.addEventListener('auth-lost', () => {
@@ -1034,6 +1166,7 @@ cleanToggle?.addEventListener('click', () => {
 });
 
 $('#new-btn').addEventListener('click', () => {
+  if (state.readOnly) return;
   state.view = 'new';
   state.current = null;
   state.detail = null;
@@ -1045,6 +1178,8 @@ $('#new-btn').addEventListener('click', () => {
 });
 
 sessionList.addEventListener('click', (event) => {
+  const remove = event.target.closest('[data-delete-session]');
+  if (remove) { requestDeleteSession(remove.dataset.deleteSession); return; }
   const button = event.target.closest('[data-session]');
   if (button) openSession(button.dataset.session);
 });
@@ -1061,6 +1196,7 @@ content.addEventListener('click', async (event) => {
   const button = event.target.closest('[data-action]');
   if (!button) return;
   const action = button.dataset.action;
+  if (state.readOnly) return;
   try {
     if (action === 'cancel') {
       state.view = 'empty';
@@ -1162,6 +1298,7 @@ content.addEventListener('click', async (event) => {
     const result = await api('/api/me');
     state.user = result.username;
     state.pass = result.pass;
+    state.readOnly = Boolean(result.read_only);
     await showMain();
   } catch (error) {
     showLogin();

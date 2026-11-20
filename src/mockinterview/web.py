@@ -2,11 +2,12 @@
 
 Access control is a two-layer split:
 
-- The pass cookie gates the whole /api surface. Passes are issued by the CLI
+- The pass cookie gates writes and private usernames. Passes are issued by the CLI
   (`mockinterview pass new`): long-lived ones for the owner, temp ones with a
   token quota for guests. Only the SHA-256 hash of a token is stored.
 - The username cookie is still just a data grouping label: any name entered
   with a valid pass is created on first use.
+- Tokenless guest sessions can only read the public guest examples.
 
 Model-consuming operations (create / answer / resume) additionally require
 temp-pass quota headroom; reads and history stay open after exhaustion.
@@ -586,11 +587,10 @@ def create_app(service: WebService) -> FastAPI:
 
     @app.middleware("http")
     async def pass_gate(request: Request, call_next):
-        """One gate for the whole /api surface; the pass cookie is the door.
+        """Allow tokenless guest reads; all other API access requires a valid pass.
 
-        /api/login carries the token in its body, static pages must load so the
-        login form can be shown at all — everything else needs a valid pass.
-        The validated row is stashed on request.state for quota checks.
+        Login validates its body and logout must remain available after expiry.
+        The validated row and read-only status are shared with route dependencies.
         """
         path = request.url.path
         if path.startswith("/api/") and path != "/api/login":

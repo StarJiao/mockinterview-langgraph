@@ -4,21 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>模拟面试</title>
-  <link rel="stylesheet" href="app.css?v=11">
+  <link rel="stylesheet" href="app.css?v=13">
 </head>
 <body>
   <section id="login-view" class="login-wrap">
     <div class="login-card">
       <div class="brand big"><span class="brand-mark"></span>模拟面试</div>
-      <p class="muted">凭访问令牌进入 · 用户名只用于区分数据</p>
       <form id="login-form">
         <label for="pass-input">访问令牌</label>
-        <input id="pass-input" name="pass_token" type="text" autocomplete="off" placeholder="粘贴作者给你的令牌（链接可自动带入）">
+        <input id="pass-input" name="pass_token" type="text" autocomplete="off" placeholder="联系作者获取">
         <label for="username">用户名</label>
-        <input id="username" name="username" type="text" maxlength="32" autocomplete="off" placeholder="例如：焦明星">
+        <input id="username" name="username" type="text" maxlength="32" autocomplete="off" placeholder="仅用于区分用户的数据，随意填写">
         <button class="primary full" type="submit">进入</button>
+        <button class="outline full" id="guest-login" type="button">以只读身份进入</button>
       </form>
-      <p class="hint">令牌由作者签发：临时令牌从你第一次进入时开始计时，长期令牌不限配额。用户名可随意填写，只用于区分各自的数据，不是身份验证。</p>
+      <p class="hint">本站作者：mingxingjiao@qq.com</p>
       <p id="login-error" class="error" hidden></p>
     </div>
   </section>
@@ -27,8 +27,8 @@
     <header class="topbar">
       <div class="brand"><span class="brand-mark"></span>模拟面试</div>
       <div class="topright">
-        <span class="who" id="pass-status"></span>
         <span class="who" id="who"></span>
+        <span class="who" id="pass-status"></span>
         <button class="clean-toggle" id="clean-toggle" type="button"
           role="switch" aria-checked="true" aria-label="纯净模式" title="纯净模式：只显示面试官与你的对话">
           <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
@@ -40,12 +40,24 @@
     <div class="layout">
       <aside class="sidebar">
         <button class="primary full" id="new-btn" type="button">新建面试</button>
-        <div class="side-title">我的面试</div>
+        <div id="readonly-intro" class="readonly-intro" hidden>正在浏览 guest 的示例会话。想亲自体验，请联系作者获取访问令牌。<button class="ghost" id="token-login" type="button">使用令牌登录</button></div>
+        <div class="side-title" id="session-title">我的面试</div>
+        <div id="session-error" class="error" role="alert" hidden></div>
         <div id="session-list" class="session-list"></div>
       </aside>
       <main class="content" id="content"></main>
     </div>
   </div>
-  <script src="app.js?v=11"></script>
+  <dialog id="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description">
+    <h2 id="delete-title">删除这场面试？</h2>
+    <p id="delete-description"></p>
+    <p class="muted">删除后将从列表中隐藏，原始记录仍会保留。</p>
+    <p id="delete-error" class="error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button class="ghost" id="cancel-delete" type="button" autofocus>取消</button>
+      <button class="danger" id="confirm-delete" type="button">确认删除</button>
+    </div>
+  </dialog>
+  <script src="app.js?v=13"></script>
 </body>
 </html>

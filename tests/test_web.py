@@ -798,26 +798,6 @@ def test_stream_diff_handles_event_anchor_shift_without_full_hello():
     assert shifted == {"kind": "truncate", "keep": 1, "items": [answer, decision, event]}
 
 
-def test_stream_diff_handles_event_anchor_shift_without_full_hello():
-    """Event messages shift forward once a round gains answer/decision lines;
-    the diff must truncate the shifted tail, not degenerate into a full hello."""
-    from mockinterview.web import stream_delta
-
-    question = {"role": "interviewer", "label": "面试官", "text": "主问1：…", "anchor": "q:a:r0"}
-    event = {"role": "system", "label": "系统", "text": "候选人已提交本轮回答，等待生成下一步", "anchor": "q:a:r0"}
-    answer = {"role": "candidate", "label": "候选人", "text": "我的回答", "anchor": "q:a:r0"}
-    decision = {"role": "system", "label": "系统", "text": "快评决策：已给出部分证据", "anchor": "q:a:r0"}
-
-    assert stream_delta(None, [question, event])["kind"] == "hello"
-    assert stream_delta([question], [question])["kind"] == "none"
-    # 纯尾部增长：普通 append
-    pure = stream_delta([question, event], [question, event, answer])
-    assert pure == {"kind": "truncate", "keep": 2, "items": [answer]}
-    # 事件移位：截掉移位尾巴后重发，已渲染的历史节点不动
-    shifted = stream_delta([question, event], [question, answer, decision, event])
-    assert shifted == {"kind": "truncate", "keep": 1, "items": [answer, decision, event]}
-
-
 async def test_events_stream_exits_once_the_service_is_stopping(web):
     """Shutdown must not hang on an endless stream: the flag ends the generator."""
     client, service, _ = web
@@ -868,3 +848,113 @@ def test_submission_receipt_waits_for_candidate_checkpoint():
     state = {"questions": [{"id": "a", "rounds": [{"ask": "问题"}]}]}
     events = [{"anchor": "q:a:r0:submit", "role": "system", "text": "候选人已提交本轮回答"}]
     assert not any(m["text"].startswith("候选人已提交") for m in build_messages(state, None, events))
+
+
+async def test_readonly_guest_can_read_examples_but_cannot_write_or_read_other_users(web):
+    client, service, application = web
+    await login(client, "alice", service=service)
+    private_id = (await new_interview(client)).json()["id"]
+    await service.wait(private_id)
+    await login(client, "guest", service=service)
+    sid = (await new_interview(client)).json()["id"]
+    await service.wait(sid)
+    assert not (await client.get('/api/me')).json()['read_only']
+    # Valid-token guest can answer, complete and manage the public examples.
+    assert (await client.post(f'/api/interviews/{sid}/answer', json={
+        'answer': '', 'confirm_empty': True,
+    })).status_code == 202
+    await service.wait(sid)
+    assert (await client.get(f'/api/interviews/{sid}/report')).status_code == 200
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url='http://test') as reader:
+        r = await reader.post('/api/login', json={'username': 'guest'})
+        assert r.status_code == 200 and r.json()['read_only']
+        assert 'mi_pass' not in reader.cookies
+        assert (await reader.get('/api/me')).json() == {'username':'guest', 'pass':None, 'read_only':True}
+        assert [s['id'] for s in (await reader.get('/api/interviews')).json()['sessions']] == [sid]
+        for suffix in ('', '/events?once=1', '/timings', '/report', '/status'):
+            assert (await reader.get(f'/api/interviews/{sid}{suffix}')).status_code == 200
+            assert (await reader.get(f'/api/interviews/{private_id}{suffix}')).status_code == 404
+        for path in ('/api/interviews', f'/api/interviews/{sid}/answer', f'/api/interviews/{sid}/resume'):
+            assert (await reader.post(path, json={})).status_code == 403
+        assert (await reader.delete(f'/api/interviews/{sid}')).status_code == 403
+        assert (await reader.get('/server')).status_code == 401
+        # The public guest cookie is not a way to choose a private username.
+        reader.cookies.set('mi_user', 'alice')
+        assert (await reader.get('/api/interviews')).status_code == 401
+        assert (await reader.post('/api/logout')).status_code == 200
+    assert (await client.delete(f'/api/interviews/{sid}')).status_code == 200
+
+
+async def test_guest_login_explicitly_downgrades_and_valid_token_upgrades(web):
+    client, service, _ = web
+    token, pass_id = await make_pass(service)
+    await login(client, 'guest', token=token)
+    assert not (await client.get('/api/me')).json()['read_only']
+    response = await client.post('/api/login', json={'username':'guest', 'pass_token':''})
+    assert response.status_code == 200
+    assert 'mi_pass' not in client.cookies
+    assert (await client.get('/api/me')).json()['read_only']
+    assert (await client.post('/api/login', json={'username':'alice'})).status_code == 401
+    assert (await client.post('/api/login', json={'username':'guest','pass_token':'invalid'})).status_code == 401
+    await login(client, 'guest', token=token)
+    assert not (await client.get('/api/me')).json()['read_only']
+    await service.store.revoke_pass(pass_id)
+    assert (await client.get('/api/me')).status_code == 401
+    assert (await client.delete('/api/interviews/anything')).status_code == 401
+    assert (await client.post('/api/logout')).status_code == 200
+
+
+async def test_soft_delete_is_owned_persistent_and_preserves_data(web):
+    client, service, _ = web
+    await login(client, service=service)
+    sid = (await new_interview(client)).json()['id']
+    await service.wait(sid)
+    await login(client, 'bob', service=service)
+    assert (await client.delete(f'/api/interviews/{sid}')).status_code == 404
+    await login(client, service=service)
+    before = await service.app.inspect(sid)
+    assert (await client.delete(f'/api/interviews/{sid}')).json() == {'id':sid, 'deleted':True}
+    assert (await client.get('/api/interviews')).json()['sessions'] == []
+    for suffix in ('', '/events?once=1', '/timings', '/report', '/status'):
+        assert (await client.get(f'/api/interviews/{sid}{suffix}')).status_code == 404
+    for suffix in ('/answer', '/resume'):
+        assert (await client.post(f'/api/interviews/{sid}{suffix}', json={'answer':'answer'})).status_code == 404
+    assert (await client.delete(f'/api/interviews/{sid}')).status_code == 404
+    # Raw checkpoints are retained for recovery, while public lookup stays hidden.
+    assert (await service.app.inspect(sid)).state == before.state
+    reopened = OperationStore(service.store.path)
+    await reopened.open()
+    try:
+        assert await reopened.owner(sid) is None
+        assert await reopened.list_sessions('alice') == []
+        async with reopened.conn.execute('SELECT deleted_at FROM sessions WHERE id=?', (sid,)) as cursor:
+            assert (await cursor.fetchone())[0]
+        assert await reopened.stage_metrics(sid)
+    finally:
+        await reopened.close()
+
+
+async def test_delete_waits_for_active_work_and_does_not_require_model_quota(web):
+    import asyncio
+    client, service, _ = web
+    token, _ = await make_pass(service, kind='temp', quota=10)
+    await login(client, token=token)
+    sid = (await new_interview(client)).json()['id']
+    await service.wait(sid)
+    hold = asyncio.Event()
+    await service.launch(sid, hold.wait)
+    assert (await client.delete(f'/api/interviews/{sid}')).status_code == 409
+    hold.set()
+    await service.wait(sid)
+    task = asyncio.create_task(asyncio.Event().wait())
+    service.app.jobs.tasks[(sid, 'test-scoring')] = task
+    assert (await client.delete(f'/api/interviews/{sid}')).status_code == 409
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    # Deleting is not a model call and remains available after quota exhaustion.
+    service.store.pass_usage = lambda _: asyncio.sleep(0, result=10)
+    assert (await client.delete(f'/api/interviews/{sid}')).status_code == 200
+    with pytest.raises(Exception) as exc:
+        await service.launch(sid, hold.wait)
+    assert exc.value.status_code == 404

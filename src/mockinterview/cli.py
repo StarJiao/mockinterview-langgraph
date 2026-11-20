@@ -417,7 +417,7 @@ async def run(args) -> int:
         shown_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
         console.system(
             f"Web 界面：http://{shown_host}:{args.port}（监听 {args.host}:{args.port}）；"
-            "所有 API 凭访问令牌进入（pass new 签发），用户名只用于区分数据。"
+            "无需令牌可用 guest 只读浏览；新建和管理面试需访问令牌（pass new 签发）。"
         )
         await serve(
             backend, Path(args.data_dir), options_base, args.host, args.port,
