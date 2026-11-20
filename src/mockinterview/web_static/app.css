@@ -166,7 +166,7 @@ button { cursor: pointer; }
   from { opacity: 0; transform: translateY(14px); }
   to { opacity: 1; transform: none; }
 }
-.msg.enter, .q-divider.enter { animation: msg-in .8s cubic-bezier(.22, .61, .36, 1) both; }
+.msg.enter, .q-divider.enter { animation: msg-in .24s cubic-bezier(.22, .61, .36, 1) both; }
 
 /* 打字机光标：流式输出期间挂在消息正文末尾。 */
 .msg-body.typing::after {
@@ -263,3 +263,5 @@ button { cursor: pointer; }
   .clean-toggle { padding: 4px 6px; }
   .clean-toggle .switch-label { display: none; }
 }
+
+.msg[hidden] { display: none; }

@@ -77,7 +77,9 @@ class AnswerBody(BaseModel):
     confirm_empty: bool = False
 
 
-def build_messages(state: dict, pending: dict | None, events: list[dict]) -> list[dict]:
+def build_messages(
+    state: dict, pending: dict | None, events: list[dict], timings: list[dict] | None = None
+) -> list[dict]:
     """Rebuild the three-role stream from checkpointed facts.
 
     Interviewer/candidate lines come from Graph State, so old CLI sessions replay
@@ -140,19 +142,18 @@ def build_messages(state: dict, pending: dict | None, events: list[dict]) -> lis
                 f"本题结束 · {question.get('closing_reason', '') or '未记录原因'}",
                 f"q:{qid}:close",
             )
+            add("system", "系统", "本题已提交后台评分", f"q:{qid}:close")
             evaluation = evaluations.get(qid)
             if evaluation:
                 score = evaluation.get("score") or "未计算总分（部分维度证据不足）"
-                add("system", "系统", f"单题评分已保存 · {score}", f"q:{qid}:close")
+                add("system", "系统", f"单题评分已保存 · 第 {qi} 题 · {score}", f"q:{qid}:close")
             elif qid in failures:
                 add(
                     "system",
                     "系统",
-                    f"单题评分失败（{failures[qid]}），可稍后补评",
+                    f"单题评分失败 · 第 {qi} 题（{failures[qid]}），可稍后补评",
                     f"q:{qid}:close",
                 )
-            else:
-                add("system", "系统", "单题评分尚未完成，后台任务仍在运行", f"q:{qid}:close")
     if state.get("status") == "done":
         tokens = sum(state.get("usage", {}).values())
         add(
@@ -210,10 +211,67 @@ def build_messages(state: dict, pending: dict | None, events: list[dict]) -> lis
         last_of_anchor = index == len(base) - 1 or base[index + 1]["anchor"] != anchor
         if last_of_anchor:
             stream.extend(by_anchor.pop(anchor, []))
-    for group in (waits_by_round, submits_by_round, by_anchor):
+    # 提交事件可能早于答案 checkpoint；此时暂不提前展示提交确认。
+    for group in (waits_by_round, by_anchor):
         for anchor in sorted(group):
             stream.extend(group[anchor])
-    return stream
+    return chronological_messages(stream, questions, events, timings or [])
+
+
+def chronological_messages(messages, questions, events, timings):
+    """Use durable occurrence times, rather than grouping late scores under old questions.
+
+    Older CLI/preset sessions may lack metrics; retain their reconstructed order.
+    Equal timestamps keep the causal order from build_messages (answer before receipt).
+    """
+    if not timings:
+        return messages
+    stages = {item["key"]: item for item in timings}
+    event_times = {
+        (item["anchor"], item["role"], item["text"]): item["created_at"]
+        for item in events if item.get("created_at")
+    }
+    submits = {
+        item["anchor"].removesuffix(":submit"): item["created_at"]
+        for item in events
+        if item.get("created_at") and item["text"].startswith("候选人已提交本轮回答")
+    }
+    times = {}
+    for index, question in enumerate(questions):
+        qid = question["id"]
+        stage = stages.get(f"question:{index}", {})
+        times[(f"q:{qid}:open", "system")] = stage.get("started_at")
+        for ri, _ in enumerate(question.get("rounds", [])):
+            anchor = f"q:{qid}:r{ri}"
+            ask = stage if ri == 0 else stages.get(f"probe:v2:{qid}:{ri}", {})
+            times[(anchor, "interviewer")] = ask.get("finished_at")
+            times[(anchor, "candidate")] = submits.get(anchor)
+            decision = stages.get(f"coverage:v2:{qid}:{ri}", {})
+            times[(anchor, "system")] = decision.get("finished_at") or submits.get(anchor)
+        closing = stages.get(f"closing:{qid}", {}).get("finished_at")
+        times[(f"q:{qid}:close", "interviewer")] = closing
+        times[(f"q:{qid}:close", "system")] = closing
+    latest = max(item["finished_at"] for item in timings)
+    ordered = []
+    previous = min([item["started_at"] for item in timings] + list(event_times.values()))
+    for message in messages:
+        anchor, role, text = message["anchor"], message["role"], message["text"]
+        occurred = event_times.get((anchor, role, text)) or times.get((anchor, role))
+        if text.startswith(("单题评分已保存", "单题评分失败")):
+            qid = anchor.removeprefix("q:").removesuffix(":close")
+            metric = stages.get(f"eval:{qid}")
+            if metric:
+                occurred = metric["finished_at"]
+            elif f"closing:{qid}" in stages:
+                # Receipt commit precedes metric commit by a few awaits; next SSE tick
+                # will expose the result with its actual timestamp, without a jump.
+                continue
+        if anchor == "end" and not occurred:
+            occurred = latest
+        occurred = occurred or previous
+        previous = occurred
+        ordered.append((occurred, message))
+    return [message for _, message in sorted(ordered, key=lambda item: item[0])]
 
 
 def pending_anchor(turn) -> str:
@@ -715,7 +773,9 @@ def create_app(service: WebService) -> FastAPI:
         events = await service.store.events(session_id)
         return {
             "session": session_meta(session_id, turn.state, turn.pending, turn.done),
-            "messages": build_messages(turn.state, turn.pending, events),
+            "messages": build_messages(
+                turn.state, turn.pending, events, await service.store.stage_metrics(session_id)
+            ),
             "pending": turn.pending,
             "done": turn.done,
             "busy": busy,
@@ -815,7 +875,10 @@ def create_app(service: WebService) -> FastAPI:
                     revision = await service.store.revision(session_id)
                     common = event_state(service, session_id, turn, busy, revision)
                     events_list = await service.store.events(session_id)
-                    messages = build_messages(turn.state, turn.pending, events_list)
+                    messages = build_messages(
+                        turn.state, turn.pending, events_list,
+                        await service.store.stage_metrics(session_id),
+                    )
                     signature = json.dumps(common, ensure_ascii=False, default=str, sort_keys=True)
                     delta = stream_delta(sent, messages)
                     if delta["kind"] == "hello":

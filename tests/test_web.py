@@ -829,3 +829,42 @@ async def test_events_stream_exits_once_the_service_is_stopping(web):
     response = await client.get(f"/api/interviews/{session_id}/events")
     assert response.status_code == 200
     assert response.text == ""
+
+
+def test_late_scoring_uses_occurrence_time_and_keeps_submission_history():
+    from mockinterview.web import build_messages
+
+    state = {
+        "options": {"num_questions": 2},
+        "questions": [
+            {"id": "a", "status": "done", "closing": "第一题结束", "rounds": [
+                {"ask": "第一题", "answer": "回答", "decision": {"reason": "结束"}}
+            ]},
+            {"id": "b", "status": "running", "rounds": [{"ask": "第二题"}]},
+        ],
+        "evaluations": {"a": {"score": 80}},
+    }
+    def metric(key, start, finish):
+        return {"key": key, "started_at": f"2026-11-19T00:00:{start:02d}+00:00",
+                "finished_at": f"2026-11-19T00:00:{finish:02d}+00:00"}
+    timings = [metric("question:0", 1, 2), metric("coverage:v2:a:0", 4, 5),
+               metric("closing:a", 5, 6), metric("question:1", 7, 8), metric("eval:a", 6, 10)]
+    events = [{"anchor": "q:a:r0:submit", "role": "system",
+               "text": "候选人已提交本轮回答", "created_at": "2026-11-19T00:00:04+00:00"}]
+    messages = build_messages(state, None, events, timings)
+    texts = [m["text"] for m in messages]
+    next_question = next(i for i, m in enumerate(messages) if m["anchor"] == "q:b:r0")
+    score = next(i for i, text in enumerate(texts) if text.startswith("单题评分已保存"))
+    assert score > next_question
+    assert texts.index("本题已提交后台评分") < next_question
+    assert texts.index("回答") < texts.index("候选人已提交本轮回答")
+    state["evaluations"] = {}
+    assert "本题已提交后台评分" in [m["text"] for m in build_messages(state, None, events, timings)]
+
+
+def test_submission_receipt_waits_for_candidate_checkpoint():
+    from mockinterview.web import build_messages
+
+    state = {"questions": [{"id": "a", "rounds": [{"ask": "问题"}]}]}
+    events = [{"anchor": "q:a:r0:submit", "role": "system", "text": "候选人已提交本轮回答"}]
+    assert not any(m["text"].startswith("候选人已提交") for m in build_messages(state, None, events))

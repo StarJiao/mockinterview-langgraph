@@ -14,3 +14,5 @@ inputs/*
 !inputs/preset-followup-example.json
 .DS_Store
 .workbuddy/
+
+node_modules/

@@ -159,3 +159,21 @@ checkpoint 写入失败、后台评分重叠与补交、并发打开保护、中
 - 不自动迁移被改过的旧图 checkpoint；改图后旧会话按原样只读或结束。
 - token 预算是软上限，缺 usage 的失败请求无法精确计费，报告不能替代账单。
 - 报告是单题评价的汇总，没有整场模型总评。
+
+### Web 交互回归测试
+
+前端测试使用轻量 DOM 环境，覆盖消息增量同步、流式定稿、迟到事件、纯净模式切换与草稿保留：
+
+```bash
+npm ci
+npm test
+```
+
+本地离线体验（不调用模型，建议使用独立数据目录）：
+
+```bash
+uv run mockinterview web --demo --host 127.0.0.1 --port 8765 --data-dir /tmp/interview-demo
+uv run mockinterview pass new --days 1 --data-dir /tmp/interview-demo --base-url http://127.0.0.1:8765
+```
+
+使用生成的链接进入。普通模式显示系统消息和统计，纯净模式隐藏系统消息但保留题目分隔线；切换不打断正在输出的问题。回答框支持 Ctrl / ⌘ + Enter 提交。

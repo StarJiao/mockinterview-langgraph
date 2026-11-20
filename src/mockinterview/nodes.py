@@ -15,10 +15,10 @@ class Nodes:
         # emitter(session_id, event) 把出题/追问的流式增量发给 Web 层；CLI 传 None。
         self.emitter = emitter
 
-    def _stream_sink(self, session_id: str):
+    def _stream_sink(self, session_id: str, anchor: str):
         if self.emitter is None:
             return None
-        return lambda event: self.emitter(session_id, {"type": "qstream", **event})
+        return lambda event: self.emitter(session_id, {"type": "qstream", "anchor": anchor, **event})
 
     def _emit(self, session_id: str, event: dict):
         if self.emitter is not None:
@@ -93,6 +93,7 @@ class Nodes:
                 state["session_id"],
                 {
                     "type": "qopen",
+                    "anchor": f"q:{state['session_id']}-q{index + 1}:open",
                     "index": index + 1,
                     "total": len(state["plan"]),
                     "topic": topic.get("topic", ""),
@@ -103,7 +104,9 @@ class Nodes:
                 state,
                 f"question:{index}",
                 lambda: self.backend.question(
-                    topic, index + 1, len(state["plan"]), on_delta=self._stream_sink(state["session_id"])
+                    topic, index + 1, len(state["plan"]), on_delta=self._stream_sink(
+                        state["session_id"], f"q:{state['session_id']}-q{index + 1}:r0"
+                    )
                 ),
             )
         questions = deepcopy(state["questions"])
@@ -186,7 +189,9 @@ class Nodes:
             state,
             f"probe:v2:{q['id']}:{round_index}",
             lambda: self.backend.probe(
-                q, state["decision"]["target"], hop, on_delta=self._stream_sink(state["session_id"])
+                q, state["decision"]["target"], hop, on_delta=self._stream_sink(
+                    state["session_id"], f"q:{q['id']}:r{round_index}"
+                )
             ),
         )
         if not ask.strip():
